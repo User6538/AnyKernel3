@@ -1170,3 +1170,37 @@ for SUSFS_SRC in fs/proc/task_mmu.c fs/namespace.c; do
     exit 1
   fi
 done
+
+
+# ==================== 厂商模块越界导致整机 panic 重启的修复（关闭 UBSAN trap） ====================
+# 现象（本机实测，现场已留存为 console-ramoops）：
+#   上电后 863s 打印  Internal error: UBSAN: array index out of bounds: ... [#1] PREEMPT SMP
+#   出错指令在 ___slab_alloc+0x8fc/0x980，进程 Comm: zcache_mm
+#   调用链：用户态写 /sys/zcache/prio → prio_store [zcache]（厂商树外模块，/proc/modules 中带 OE）
+#           → alloc_io_context → kmem_cache_alloc_node → ___slab_alloc
+#           → ubsan_handler → die → ipanic_die → mrdump_common_die → 转储后整机重启
+#   重启原因记录：ro.boot.bootreason / persist.sys.boot.reason.history = kernel_panic
+# 为什么会从“越界报告”升级成“整机重启”：
+#   本内核 CONFIG_UBSAN_TRAP=y，运行时 kernel.panic_on_oops=1；
+#   TRAP 模式下 UBSAN 的边界检查一旦命中就直接执行 trap 指令 → die → oops → panic。
+#   （Android 官方 errata 亦明确：CONFIG_UBSAN_TRAP 启用时，边界排错程序发现问题即触发内核崩溃。）
+# 处理：把 UBSAN 从“命中即 trap”改成“打印完整报告后继续”，只去掉 trap 这一步；
+#   边界检查本身、KASAN、panic_on_oops 都保持原样，不做扩大改动。
+#   效果：厂商模块触发的越界不再把整机带走；下次发生时 dmesg 会给出完整报告
+#   （含 file:line、越界索引与数组类型），可据此定位真正的越界点再决定是否要更彻底的修法。
+# 落点：向基准 gki_defconfig 追加该配置。构建流程随后会把它的改动提取进 ksu.fragment
+#   （并把 gki_defconfig 还原为快照），或在快照已包含该行时直接保留在基准配置中——
+#   两种顺序下该行都会进入最终内核配置；Kconfig 对同一布尔项以最后出现的赋值为准。
+DEFCONFIG_FILE="common/arch/arm64/configs/gki_defconfig"
+if [[ -f "$DEFCONFIG_FILE" ]]; then
+  if grep -qE '^# CONFIG_UBSAN_TRAP is not set$' "$DEFCONFIG_FILE"; then
+    echo "CONFIG_UBSAN_TRAP 已是关闭状态，跳过"
+  else
+    sed -i '/^CONFIG_UBSAN_TRAP=/d' "$DEFCONFIG_FILE"
+    printf '# CONFIG_UBSAN_TRAP is not set\n' >> "$DEFCONFIG_FILE"
+    echo "已在 $DEFCONFIG_FILE 关闭 CONFIG_UBSAN_TRAP（UBSAN 改为报告而非 trap，避免厂商模块越界直接 panic 重启）"
+  fi
+  grep -n 'CONFIG_UBSAN_TRAP' "$DEFCONFIG_FILE" || true
+else
+  echo "::warning::未找到 $DEFCONFIG_FILE，跳过 UBSAN_TRAP 调整"
+fi
