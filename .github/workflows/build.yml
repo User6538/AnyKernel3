@@ -1162,33 +1162,6 @@ jobs:
             echo "::warning::lz4k_oplus.patch 应用失败，可能已应用或上下文不匹配"
           fi
 
-      - name: 关闭 swap（内核侧拒绝所有 swap）
-        working-directory: ${{ env.KERNEL_ROOT }}/common
-        run: |
-          SWAP_PATCH="$GITHUB_WORKSPACE/swap_patch/refuse_all_swap.patch"
-          if [ ! -f "$SWAP_PATCH" ]; then
-            echo "::error::未找到 $SWAP_PATCH"
-            exit 1
-          fi
-          if grep -q "refuse all swap" mm/swapfile.c; then
-            echo "mm/swapfile.c 已含关闭 swap 补丁，跳过（幂等）"
-          elif patch -p1 --forward --batch < "$SWAP_PATCH"; then
-            echo "已应用关闭 swap 补丁：mm/swapfile.c 拒绝所有 swapon 请求（zram 与 swapfile 都进不来）"
-          elif [ "$SKIP_INCOMPATIBLE" = "true" ]; then
-            echo "::warning title=关闭 swap 补丁已跳过::补丁应用失败（mm/swapfile.c 上下文不匹配），已跳过该功能继续构建"
-            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-              echo "" >> "$GITHUB_STEP_SUMMARY"
-              echo "> ⏭️ **关闭 swap（拒绝所有 swap）** 已自动跳过：补丁应用失败（构建未中断）" >> "$GITHUB_STEP_SUMMARY"
-            fi
-          else
-            echo "::error::关闭 swap 补丁应用失败：mm/swapfile.c 上下文不匹配"
-            exit 1
-          fi
-          echo "--- 校验 ---"
-          grep -n -A4 "refuse all swap" mm/swapfile.c || {
-            echo "::error::校验失败：mm/swapfile.c 未见关闭 swap 补丁标记"
-            exit 1
-          }
       - name: 修复 6.6 WiFi/蓝牙兼容性（三星 + 小米）
         if: inputs.kernel_version == '6.6'
         working-directory: ${{ env.KERNEL_ROOT }}/common
