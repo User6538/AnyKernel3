@@ -737,7 +737,7 @@ fi
 # 背景：本版 SUSFS 用 inode->i_mapping->flags 的第 33 位（AS_FLAGS_SUS_PATH）承载 sus_path 判定
 # 结果，并在各 VFS 入口用 susfs_is_inode_sus_path() 检查。该位并非 SUSFS 独占：厂商内核可能
 # 使用同一位，或因 inode/address_space 复用而残留该位。一旦与 SUSFS 无关的文件带上该位，就会被
-# 判为“应隐藏路径”：/data/app/*.apk 属主为 system，任何非 system 的应用进程打开都会得到
+# 判为“应隐藏路径”：/data/app 下的 APK 属主为 system，任何非 system 的应用进程打开都会得到
 # ENOENT/EIO，应用在 ActivityThread 阶段拿不到 Resources 直接 NPE 崩溃；命中集合随 inode
 # 分配/复用变化，表现为“每次重启崩的应用不同、本次开机中招的应用持续崩溃”。
 # 实测（vivo V2507A / android15 6.6.57）：内核整段启动日志（t=0 起）中不存在任何
@@ -767,7 +767,7 @@ GUARD = '''
 /* FINASU_SUS_PATH_ID_GUARD: sus_path 的判定原本只看 i_mapping->flags 第 33 位
  * (AS_FLAGS_SUS_PATH)。该位不是 SUSFS 独占的：厂商内核可能使用同一位，或因
  * inode/address_space 复用而残留，从而把与 SUSFS 无关的文件误判成隐藏路径
- * （实测应用自身 /data/app/*.apk 被误伤，应用启动即 NPE 崩溃）。
+ * （实测应用自身在 /data/app 下的 APK 被误伤，应用启动即 NPE 崩溃）。
  * 这里为 sus_path 增加身份表：登记被 SUSFS 标记过的 (s_dev, i_ino)，判定时要求身份
  * 匹配，杂散置位不再误伤；SUSFS 的置位点与登记点一一对应，功能语义不变。 */
 static DEFINE_MUTEX(susfs_mutex_lock_sus_path_id);
@@ -835,6 +835,11 @@ static bool susfs_sus_path_id_match(struct inode *inode)
 	return found;
 }
 '''
+# 自检：注释块里出现嵌套的 /* 或 */ 会被内核的 -Werror,-Wcomment 直接判为编译错误
+# （历史上就踩过：注释里写 "/data/app/*.apk" 时其中的 "/" + "*" 被当成嵌套注释）。
+if GUARD.count("/*") != 1 or GUARD.count("*/") != 1:
+    print("::error::身份校验注释块内含嵌套的 /* 或 */（内核以 -Werror,-Wcomment 构建会直接报错），请修正脚本内注释文字")
+    raise SystemExit(1)
 
 if "#include <linux/hashtable.h>" not in src:
     src = src.replace("#include <linux/list.h>\n",
@@ -880,7 +885,12 @@ if added < 2 or guarded < 2 or added != guarded:
     print("::error::fs/susfs.c: 身份登记/判定改写数量异常 (add=%d, guard=%d)" % (added, guarded))
     raise SystemExit(1)
 
-open(P, "w", encoding="utf-8", errors="surrogateescape").write("\n".join(out))
+new_text = "\n".join(out)
+if new_text.count("/*") - src.count("/*") != 1 or new_text.count("*/") - src.count("*/") != 1:
+    print("::error::fs/susfs.c: 写出内容引入的注释标记数量异常，可能触发 -Wcomment，已中止")
+    raise SystemExit(1)
+
+open(P, "w", encoding="utf-8", errors="surrogateescape").write(new_text)
 print("fs/susfs.c: sus_path 身份校验已写入 (add=%d, guard=%d)" % (added, guarded))
 PYEOF
   grep -n 'FINASU_SUS_PATH_ID_GUARD' fs/susfs.c | head
