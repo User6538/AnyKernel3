@@ -16,6 +16,241 @@ cp "$SUSFS4KSU/kernel_patches/$SUSFS_PATCH" ./common/
 cp "$SUSFS4KSU"/kernel_patches/fs/* ./common/fs/
 cp "$SUSFS4KSU"/kernel_patches/include/linux/* ./common/include/linux/
 
+# ==================== 目标内核位占用校验（把“假定空闲”变成“构建期可验证”） ====================
+# SUSFS 把自己的私有标志塞进内核既有字段的空闲位/值，这些位都不是给第三方用的：
+#   AS_FLAGS_SUS_PATH / SUS_MOUNT / SUS_KSTAT / OPEN_REDIRECT / SUS_MAP -> inode->i_mapping->flags
+#   TIF_PROC_UMOUNTED / TIF_PROC_NO_SU / TIF_PROC_UMOUNTED_FOR_ZYGOTE_NEXT -> thread_info.flags
+#   ND_STATE_LOOKUP_LAST / ND_STATE_OPEN_LAST -> nd->state；ND_FLAGS_LOOKUP_LAST -> nd->flags
+#   STATX_SUS_KSTAT -> statx 的 request_mark
+# 上游会继续占用这些空间（如 6.12 起 AS_ 的 1~31 段被 folio order 等占满），厂商内核也可能
+# 占用同一位；本次排查的崩溃正是该位被内核侧占用/残留所致。这里在应用补丁前对“本次真正要构建
+# 的内核树”做一次实际扫描：解析目标内核头文件里这些字段已定义的位/值，并全树收集写在字段上的
+# 字面量位，再与 SUSFS 选取的位逐一比对。冲突 -> ::error:: 中断构建；无法判定 -> ::warning::。
+# 只做校验，不修改任何 SUSFS 特性开关。
+if [ -d ./common ]; then
+  echo "校验 SUSFS 私有位在目标内核中的占用情况..."
+  python3 - <<'PYEOF'
+import os, re, sys
+
+KROOT = "common"
+
+SUSFS_DEF_PATHS = ["common/include/linux/susfs_def.h"]
+_env = os.environ.get("SUSFS4KSU", "")
+if _env:
+    SUSFS_DEF_PATHS.append(os.path.join(_env, "kernel_patches/include/linux/susfs_def.h"))
+
+def read_text(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except OSError:
+        return ""
+
+susfs_src = None
+for _p in SUSFS_DEF_PATHS:
+    if os.path.isfile(_p):
+        susfs_src = _p
+        break
+if susfs_src is None:
+    print("::warning::未找到 susfs_def.h，跳过 SUSFS 私有位占用校验")
+    sys.exit(0)
+
+NUM_RE = r"(?:0[xX][0-9a-fA-F]+|[0-9]+)"
+DEF_RE = re.compile(r"^#define\s+([A-Z][A-Z0-9_]*)\s+([0-9A-Za-z_()\s+\-*<>x]+?)\s*(?:/\*.*)?$", re.M)
+ENUM_RE = re.compile(r"^\s*([A-Z][A-Z0-9_]*)\s*=\s*([^,\n]+?)\s*,", re.M)
+BITOP_RE = re.compile(r"\b(?:__)?(?:set|clear|test|test_and_set|change|assign)_bit\s*\(\s*(0[xX][0-9a-fA-F]+|[0-9]+)\s*,")
+
+def resolve(expr, table):
+    expr = expr.strip()
+    expr = re.sub(r"[uUlL]+$", "", expr)
+    if re.fullmatch(NUM_RE, expr):
+        return int(expr, 0)
+    if not re.fullmatch(r"[0-9A-Za-z_()\s+\-*<>]+", expr):
+        return None
+    tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*|0[xX][0-9a-fA-F]+|[0-9]+|[()+\-*<>]|\s+", expr)
+    if "".join(tokens) != expr:
+        return None
+    parts = []
+    for tok in tokens:
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", tok):
+            if tok not in table:
+                return None
+            parts.append(str(table[tok]))
+        elif re.fullmatch(r"0[xX][0-9a-fA-F]+|[0-9]+", tok):
+            parts.append(str(int(tok, 0)))
+        else:
+            parts.append(tok)
+    try:
+        return int(eval("".join(parts), {"__builtins__": {}}, {}))
+    except Exception:
+        return None
+
+def collect(rel_path, prefix, table):
+    path = os.path.join(KROOT, rel_path)
+    if not os.path.isfile(path):
+        return False
+    text = read_text(path)
+    for _ in range(3):
+        for rx in (DEF_RE, ENUM_RE):
+            for m in rx.finditer(text):
+                name = m.group(1)
+                if not name.startswith(prefix) or name in table:
+                    continue
+                val = resolve(m.group(2), table)
+                if val is not None:
+                    table[name] = val
+    return True
+
+SUSFS_WANTED = ("AS_FLAGS_", "TIF_PROC_", "ND_STATE_", "ND_FLAGS_", "STATX_")
+susfs_defs = {}
+_sdef_text = read_text(susfs_src)
+for m in DEF_RE.finditer(_sdef_text):
+    if not m.group(1).startswith(SUSFS_WANTED):
+        continue
+    val = resolve(m.group(2), susfs_defs)
+    if val is None:
+        try:
+            val = int(m.group(2), 0)
+        except ValueError:
+            continue
+    susfs_defs[m.group(1)] = val
+
+FIELDS = {
+    "mapping":     ("AS_",      ["include/linux/pagemap.h", "include/linux/fs.h"], "bits"),
+    "thread_info": ("TIF_",     ["arch/arm64/include/asm/thread_info.h", "include/linux/thread_info.h"], "bits"),
+    # nd->state 在内核里用的是 ND_ROOT_PRESET/ND_ROOT_GRABBED/ND_JUMPED（fs/namei.c），
+    # nd->flags 用的是 LOOKUP_*（include/linux/namei.h），二者都按位掩码比对。
+    "nd_state":    ("ND_",      ["fs/namei.c", "include/linux/namei.h"], "value_mask"),
+    "nd_flags":    ("LOOKUP_",  ["include/linux/namei.h"], "value_mask"),
+    "statx":       ("STATX_",   ["include/uapi/linux/stat.h"], "value_mask"),
+}
+CHECK = [
+    ("AS_FLAGS_SUS_PATH", "mapping"),
+    ("AS_FLAGS_SUS_MOUNT", "mapping"),
+    ("AS_FLAGS_SUS_KSTAT", "mapping"),
+    ("AS_FLAGS_OPEN_REDIRECT", "mapping"),
+    ("AS_FLAGS_SUS_MAP", "mapping"),
+    ("TIF_PROC_UMOUNTED", "thread_info"),
+    ("TIF_PROC_NO_SU", "thread_info"),
+    ("TIF_PROC_UMOUNTED_FOR_ZYGOTE_NEXT", "thread_info"),
+    ("ND_STATE_LOOKUP_LAST", "nd_state"),
+    ("ND_STATE_OPEN_LAST", "nd_state"),
+    ("ND_FLAGS_LOOKUP_LAST", "nd_flags"),
+    ("STATX_SUS_KSTAT", "statx"),
+]
+
+occ = {}
+for key, (prefix, files, kind) in FIELDS.items():
+    table = {}
+    present = False
+    for _ in range(3):
+        for rel in files:
+            if collect(rel, prefix, table):
+                present = True
+    values = dict(table)
+    if key == "mapping":
+        mn = table.get("AS_FOLIO_ORDER_MIN")
+        mx = table.get("AS_FOLIO_ORDER_MAX")
+        if mn is not None and mx is not None and 0 <= mn <= mx < 512:
+            for b in range(mn, mx + 1):
+                values["AS_FOLIO_ORDER_RANGE@%d" % b] = b
+    occ[key] = {"kind": kind, "values": values, "present": present}
+
+HINTS = {
+    "mapping": ["i_mapping->flags", "mapping->flags", "i_data.flags"],
+    "thread_info": ["thread_info"],
+    "nd_state": ["nd->state", "nameidata"],
+    "nd_flags": ["nd->flags"],
+    "statx": ["request_mask"],
+}
+SKIP_FILES = ("fs/susfs.c", "include/linux/susfs_def.h", "include/linux/susfs.h")
+
+def scan_literals():
+    found = {k: {} for k in HINTS}
+    for root, dirs, files in os.walk(KROOT):
+        dirs[:] = [d for d in dirs if d not in (".git", ".tmp_versions")]
+        for fn in files:
+            if not fn.endswith((".c", ".h")):
+                continue
+            rel = os.path.relpath(os.path.join(root, fn), KROOT).replace(os.sep, "/")
+            if rel in SKIP_FILES:
+                continue
+            path = os.path.join(root, fn)
+            try:
+                if os.path.getsize(path) > 6 * 1024 * 1024:
+                    continue
+            except OSError:
+                continue
+            text = read_text(path)
+            for m in BITOP_RE.finditer(text):
+                ln_start = text.rfind("\n", 0, m.start()) + 1
+                ln_end = text.find("\n", m.end())
+                line = text[ln_start:(ln_end if ln_end != -1 else len(text))]
+                if "SUSFS" in line:
+                    continue
+                where = "%s:%d" % (rel, text.count("\n", 0, m.start()) + 1)
+                for key, hints in HINTS.items():
+                    if not any(h in line for h in hints):
+                        continue
+                    if key == "thread_info" and "->flags" not in line:
+                        continue
+                    if key == "nd_state" and "state" not in line:
+                        continue
+                    found[key].setdefault(int(m.group(1), 0), where)
+    return found
+
+for key, lit in scan_literals().items():
+    for val, where in lit.items():
+        occ[key]["values"].setdefault("literal@%s" % where, val)
+    if lit:
+        occ[key]["present"] = True
+
+errors, warns, rows = [], [], []
+for macro, field in CHECK:
+    if macro not in susfs_defs:
+        rows.append((macro, "-", "-", "该分支未定义，跳过"))
+        warns.append("%s 未在 susfs_def.h 中定义（该内核分支可能未启用该宏），跳过校验" % macro)
+        continue
+    val = susfs_defs[macro]
+    info = occ[field]
+    values = info["values"]
+    if not info["present"] or not values:
+        rows.append((macro, str(val), "未知", "无法判定"))
+        warns.append("未能从目标内核解析 %s 字段（%s），%s=%s 未被校验" % (field, "/".join(FIELDS[field][1]), macro, val))
+        continue
+    hit = None
+    for oname, oval in sorted(values.items()):
+        if info["kind"] == "bits" or info["kind"] == "value_eq":
+            if val == oval:
+                hit = (oname, oval)
+                break
+        else:
+            if val == oval or (val and (val & oval) == val):
+                hit = (oname, oval)
+                break
+    if hit:
+        rows.append((macro, str(val), "%s=%s" % (hit[0], hit[1]), "冲突"))
+        errors.append("%s=%s 已被目标内核占用：%s=%s（%s 字段）" % (macro, val, hit[0], hit[1], field))
+    else:
+        rows.append((macro, str(val), "已占用 %d 项，均不相交" % len(values), "空闲"))
+
+print("--- SUSFS 私有位占用校验（目标内核目录：%s）---" % KROOT)
+for macro, val, used, verdict in rows:
+    print("  %-36s %-6s %-30s %s" % (macro, val, used, verdict))
+for w in warns:
+    print("::warning::" + w)
+if errors:
+    for e in errors:
+        print("::error::" + e)
+    print("::error::SUSFS 私有位与目标内核冲突，请调整 kernel_patches/include/linux/susfs_def.h 的位选择，"
+          "或改用不会与内核自有位重叠的存储方案；不要通过关闭 SUSFS/SUS_PATH 等特性来规避")
+    sys.exit(1)
+print("SUSFS 私有位占用校验通过：%d 项位/值均未被目标内核占用" % len([r for r in rows if r[3] == "空闲"]))
+PYEOF
+else
+  echo "::warning::未找到 ./common 内核源码目录，跳过 SUSFS 私有位占用校验"
+fi
+
 # FinaSU 上游自 cdf8711a + 5b83330b（2026-10-23）起树内原生集成 SUSFS，官方
 # docs/builtin-integration.md 明确要求**不要**应用 susfs4ksu 的
 # 10_enable_susfs_for_ksu.patch（该补丁面向上游 KernelSU 手动钩子模型，会把
@@ -495,6 +730,162 @@ PYEOF
   grep -n 'FINASU_SUS_PATH_LOOP_FALLBACK' fs/susfs.c | head
 else
   echo "::warning::未找到 fs/susfs.c 的 susfs_add_sus_path，跳过路径隐藏回退"
+fi
+
+
+# ==================== SUSFS sus_path 误伤修复（共用位域 -> 身份校验） ====================
+# 背景：本版 SUSFS 用 inode->i_mapping->flags 的第 33 位（AS_FLAGS_SUS_PATH）承载 sus_path 判定
+# 结果，并在各 VFS 入口用 susfs_is_inode_sus_path() 检查。该位并非 SUSFS 独占：厂商内核可能
+# 使用同一位，或因 inode/address_space 复用而残留该位。一旦与 SUSFS 无关的文件带上该位，就会被
+# 判为“应隐藏路径”：/data/app/*.apk 属主为 system，任何非 system 的应用进程打开都会得到
+# ENOENT/EIO，应用在 ActivityThread 阶段拿不到 Resources 直接 NPE 崩溃；命中集合随 inode
+# 分配/复用变化，表现为“每次重启崩的应用不同、本次开机中招的应用持续崩溃”。
+# 实测（vivo V2507A / android15 6.6.57）：内核整段启动日志（t=0 起）中不存在任何
+# flagged/re-flag AS_FLAGS_SUS_PATH 或 CMD_SUSFS_ADD_SUS_PATH 记录（sus_path 列表为空），
+# 却仍对应用自身的 6 个 APK 输出 hiding 判定 —— 属杂散置位误判，而非配置出来的隐藏规则。
+# 修复：sus_path 判定除该位外，还要求该 inode 的 (s_dev, i_ino) 已被 SUSFS 登记；杂散置位不再
+# 误伤。SUSFS 与 SUS_PATH 的功能、行为均保持不变（置位点与登记点一一对应）。
+if [ -f fs/susfs.c ] && grep -qF 'test_bit(AS_FLAGS_SUS_PATH,' fs/susfs.c \
+  && grep -qF 'set_bit(AS_FLAGS_SUS_PATH,' fs/susfs.c \
+  && ! grep -qF 'FINASU_SUS_PATH_ID_GUARD' fs/susfs.c; then
+  echo "为 sus_path 判定加入身份校验（消除共用位域误伤）"
+  python3 - <<'PYEOF'
+import sys
+
+P = "fs/susfs.c"
+src = open(P, encoding="utf-8", errors="surrogateescape").read()
+
+if "FINASU_SUS_PATH_ID_GUARD" in src:
+    print("fs/susfs.c 已含 sus_path 身份校验，跳过")
+    raise SystemExit(0)
+
+if "test_bit(AS_FLAGS_SUS_PATH," not in src or "set_bit(AS_FLAGS_SUS_PATH," not in src:
+    print("::error::fs/susfs.c: 未找到 sus_path 置位/判定代码，形态与预期不符")
+    raise SystemExit(1)
+
+GUARD = '''
+/* FINASU_SUS_PATH_ID_GUARD: sus_path 的判定原本只看 i_mapping->flags 第 33 位
+ * (AS_FLAGS_SUS_PATH)。该位不是 SUSFS 独占的：厂商内核可能使用同一位，或因
+ * inode/address_space 复用而残留，从而把与 SUSFS 无关的文件误判成隐藏路径
+ * （实测应用自身 /data/app/*.apk 被误伤，应用启动即 NPE 崩溃）。
+ * 这里为 sus_path 增加身份表：登记被 SUSFS 标记过的 (s_dev, i_ino)，判定时要求身份
+ * 匹配，杂散置位不再误伤；SUSFS 的置位点与登记点一一对应，功能语义不变。 */
+static DEFINE_MUTEX(susfs_mutex_lock_sus_path_id);
+static DEFINE_HASHTABLE(SUS_PATH_ID_HLIST, 8);
+
+struct st_susfs_sus_path_id {
+	struct hlist_node node;
+	dev_t s_dev;
+	unsigned long i_ino;
+};
+
+static void susfs_sus_path_id_add(struct inode *inode)
+{
+	struct st_susfs_sus_path_id *entry, *tmp_entry;
+	struct hlist_node *tmp_node;
+	dev_t s_dev;
+	unsigned long i_ino;
+
+	if (!inode || !inode->i_sb)
+		return;
+
+	s_dev = inode->i_sb->s_dev;
+	i_ino = inode->i_ino;
+
+	mutex_lock(&susfs_mutex_lock_sus_path_id);
+	hash_for_each_possible_safe(SUS_PATH_ID_HLIST, tmp_entry, tmp_node, node, i_ino) {
+		if (tmp_entry->s_dev == s_dev && tmp_entry->i_ino == i_ino) {
+			mutex_unlock(&susfs_mutex_lock_sus_path_id);
+			return;
+		}
+	}
+	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+	if (!entry) {
+		mutex_unlock(&susfs_mutex_lock_sus_path_id);
+		SUSFS_LOGE("sus_path id entry alloc failed\\n");
+		return;
+	}
+	entry->s_dev = s_dev;
+	entry->i_ino = i_ino;
+	hash_add_rcu(SUS_PATH_ID_HLIST, &entry->node, i_ino);
+	mutex_unlock(&susfs_mutex_lock_sus_path_id);
+}
+
+static bool susfs_sus_path_id_match(struct inode *inode)
+{
+	struct st_susfs_sus_path_id *entry;
+	dev_t s_dev;
+	unsigned long i_ino;
+	bool found = false;
+
+	if (!inode || !inode->i_sb)
+		return false;
+
+	s_dev = inode->i_sb->s_dev;
+	i_ino = inode->i_ino;
+
+	rcu_read_lock();
+	hash_for_each_possible_rcu(SUS_PATH_ID_HLIST, entry, node, i_ino) {
+		if (entry->s_dev == s_dev && entry->i_ino == i_ino) {
+			found = true;
+			break;
+		}
+	}
+	rcu_read_unlock();
+	return found;
+}
+'''
+
+if "#include <linux/hashtable.h>" not in src:
+    src = src.replace("#include <linux/list.h>\n",
+                      "#include <linux/list.h>\n#include <linux/hashtable.h>\n", 1)
+
+lines = src.split("\n")
+out = []
+anchor = False
+added = 0
+
+for line in lines:
+    out.append(line)
+    if not anchor and "susfs_fake_qstr_name" in line:
+        out.append(GUARD)
+        anchor = True
+        continue
+    if "set_bit(AS_FLAGS_SUS_PATH, &fi->inode.i_mapping->flags);" in line:
+        out.append(line[:len(line) - len(line.lstrip())] + "susfs_sus_path_id_add(&fi->inode);")
+        added += 1
+    elif "set_bit(AS_FLAGS_SUS_PATH, &inode->i_mapping->flags);" in line:
+        out.append(line[:len(line) - len(line.lstrip())] + "susfs_sus_path_id_add(inode);")
+        added += 1
+
+if not anchor:
+    print("::error::fs/susfs.c: 未找到 sus_path 代码段锚点，跳过修复")
+    raise SystemExit(1)
+
+pending = None
+guarded = 0
+
+for idx, line in enumerate(out):
+    if "test_bit(AS_FLAGS_SUS_PATH, &fi->inode.i_mapping->flags)" in line:
+        pending = "fuse"
+    elif "test_bit(AS_FLAGS_SUS_PATH, &inode->i_mapping->flags)" in line:
+        pending = "self"
+    elif pending and line.strip().startswith("is_i_uid_not_allowed(") and line.rstrip().endswith(")))"):
+        expr = "&fi->inode" if pending == "fuse" else "inode"
+        out[idx] = line.rstrip()[:-3] + ") && susfs_sus_path_id_match(" + expr + ")))"
+        guarded += 1
+        pending = None
+
+if added < 2 or guarded < 2 or added != guarded:
+    print("::error::fs/susfs.c: 身份登记/判定改写数量异常 (add=%d, guard=%d)" % (added, guarded))
+    raise SystemExit(1)
+
+open(P, "w", encoding="utf-8", errors="surrogateescape").write("\n".join(out))
+print("fs/susfs.c: sus_path 身份校验已写入 (add=%d, guard=%d)" % (added, guarded))
+PYEOF
+  grep -n 'FINASU_SUS_PATH_ID_GUARD' fs/susfs.c | head
+else
+  echo "::warning::fs/susfs.c 未匹配 sus_path 身份校验修复条件（sus_path 代码形态不符），跳过"
 fi
 
 
