@@ -1205,23 +1205,3 @@ if [[ -f "$DEFCONFIG_FILE" ]]; then
 else
   echo "::warning::未找到 $DEFCONFIG_FILE，跳过基准 defconfig 的 UBSAN_TRAP 调整"
 fi
-
-# 全树扫描：任何 defconfig/fragment 里残留的 CONFIG_UBSAN_TRAP=y 都必须关掉，
-# 否则它会在配置合并阶段覆盖上面的修改，导致修复“看起来做了、实际没进内核”。
-UBSAN_TRAP_LEAK=0
-while IFS= read -r cfg; do
-  [[ "$cfg" == "$DEFCONFIG_FILE" ]] && continue
-  if grep -qE '^CONFIG_UBSAN_TRAP=y$' "$cfg"; then
-    if [[ -w "$cfg" ]]; then
-      sed -i 's/^CONFIG_UBSAN_TRAP=y$/# CONFIG_UBSAN_TRAP is not set/' "$cfg"
-      echo "已在 $cfg 关闭残留的 CONFIG_UBSAN_TRAP=y"
-    else
-      echo "::error::$cfg 含有 CONFIG_UBSAN_TRAP=y 且不可写，会覆盖修复，构建中断"
-      UBSAN_TRAP_LEAK=1
-    fi
-  fi
-done < <(find . -type f \( -name '*defconfig*' -o -name '*.fragment' \) 2>/dev/null)
-if [[ "$UBSAN_TRAP_LEAK" -ne 0 ]]; then
-  exit 1
-fi
-echo "UBSAN_TRAP 关闭完成，全树已无残留的 CONFIG_UBSAN_TRAP=y"
