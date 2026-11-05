@@ -1335,6 +1335,50 @@ jobs:
             prio_fail "补丁应用后校验失败"
           fi
           echo "已在 sysfs 写入入口忽略 /sys/zcache/prio 的写入"
+      - name: 校验 slab 分配 node（规避厂商模块越界重启）
+        working-directory: ${{ env.KERNEL_ROOT }}/common
+        run: |
+          # 厂商树外 zcache 模块在启动早期会把未初始化/越界的 node 值沿
+          # prio_store → alloc_io_context 传进 slab 慢路径，越界索引
+          # s->node[node] 触发 UBSAN array index out of bounds；
+          # CONFIG_UBSAN_TRAP=y 时直接整机 panic 重启。这里在 slab 慢路径入口
+          # 把非法 node 收敛为 NUMA_NO_NODE，覆盖 sysfs / ioctl 等所有入口。
+          node_fail() {
+            if [ "$SKIP_INCOMPATIBLE" = "true" ]; then
+              echo "::warning title=slab node 校验已跳过::$1"
+              if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+                echo "" >> "$GITHUB_STEP_SUMMARY"
+                echo "> ⏭️ **slab node 校验** 已自动跳过：$1（构建未中断）" >> "$GITHUB_STEP_SUMMARY"
+              fi
+              exit 0
+            fi
+            echo "::error::$1"
+            exit 1
+          }
+
+          NODE_PATCH="$ZZH_PATCHES/prio_patch/slab_node_guard.patch"
+          if [ ! -f "$NODE_PATCH" ]; then
+            node_fail "未找到补丁文件 prio_patch/slab_node_guard.patch"
+          fi
+
+          # 幂等：已含改动则跳过
+          if grep -q "ZCACHE_NODE_GUARD" mm/slub.c; then
+            echo "mm/slub.c 已含 node 校验改动，跳过"
+            exit 0
+          fi
+
+          if git apply --check -p1 "$NODE_PATCH" >/dev/null 2>&1; then
+            git apply -p1 "$NODE_PATCH"
+          elif patch -p1 --forward --batch < "$NODE_PATCH" >/dev/null 2>&1; then
+            echo "已通过 patch 应用"
+          else
+            node_fail "mm/slub.c 补丁未应用（内核版本不匹配）"
+          fi
+
+          if ! grep -q "ZCACHE_NODE_GUARD" mm/slub.c; then
+            node_fail "补丁应用后校验失败"
+          fi
+          echo "已在 slab 慢路径入口校验 node（非法值收敛为 NUMA_NO_NODE）"
       - name: 添加 BBG 基带保护补丁
         if: inputs.use_bbg
         working-directory: ${{ env.KERNEL_ROOT }}
