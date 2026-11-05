@@ -720,22 +720,6 @@ jobs:
             exit 1
           fi
 
-      - name: 关闭 CONFIG_UBSAN_TRAP（基准 defconfig，最小改动）
-        run: |
-          # 只在基准 defconfig 上关闭 UBSAN trap，且刻意放在「备份基准 defconfig」之前：
-          # 这样改动同时落入 $DEFCONFIG 与随后备份的 $DEFCONFIG.orig，构建前的还原不会抹掉它。
-          # 不再对全树 *defconfig* / *.fragment 批量改写（此前该做法导致开机异常）。
-          if [ ! -f "$DEFCONFIG" ]; then
-            echo "::error::未找到基准 defconfig: $DEFCONFIG"
-            exit 1
-          fi
-          if grep -qE '^# CONFIG_UBSAN_TRAP is not set$' "$DEFCONFIG"; then
-            echo "CONFIG_UBSAN_TRAP 已是关闭状态，跳过"
-          else
-            sed -i '/^CONFIG_UBSAN_TRAP=/d' "$DEFCONFIG"
-            echo '# CONFIG_UBSAN_TRAP is not set' >> "$DEFCONFIG"
-            echo "已在 $DEFCONFIG 关闭 CONFIG_UBSAN_TRAP（UBSAN 改为报告而非 trap）"
-          fi
       - name: 备份基准 defconfig
         run: cp "$DEFCONFIG" "$DEFCONFIG.orig"
 
@@ -1885,45 +1869,6 @@ jobs:
           retention-days: 7
           compression-level: 9
 
-      - name: 校验内核未启用 UBSAN trap（构建后硬断言）
-        working-directory: ${{ env.KERNEL_ROOT }}
-        run: |
-          IMAGE_A="out/${{ inputs.android_version }}-${{ inputs.kernel_version }}/dist/Image"
-          IMAGE_B="$ANYKERNEL3/Image"
-          if [ ! -f "$IMAGE_A" ] && [ ! -f "$IMAGE_B" ]; then
-            if [ "$SKIP_INCOMPATIBLE" = "true" ]; then
-              echo "::warning title=UBSAN trap 校验已跳过::未找到 Image（$IMAGE_A / $IMAGE_B），无法从内嵌配置断言"
-              exit 0
-            fi
-            echo "::error::未找到 Image（已尝试 $IMAGE_A 与 $IMAGE_B），无法断言 CONFIG_UBSAN_TRAP"
-            exit 1
-          fi
-          export IMG="$IMAGE_A"
-          [ -f "$IMG" ] || export IMG="$IMAGE_B"
-          echo "校验镜像内嵌配置: $IMG"
-          python3 - <<'PYEOF'
-          import gzip, os, sys
-          img = os.environ["IMG"]
-          data = open(img, "rb").read()
-          start = data.find(b"IKCFG_ST")
-          if start < 0:
-              print("::error::镜像内未找到内嵌配置段 IKCFG_ST，无法断言 CONFIG_UBSAN_TRAP")
-              sys.exit(1)
-          end = data.find(b"IKCFG_ED", start)
-          seg = data[start + 8:end if end > 0 else len(data)]
-          try:
-              cfg = gzip.decompress(seg).decode("utf-8", "replace")
-          except Exception as exc:
-              print("::error::内嵌配置解压失败: %s" % exc)
-              sys.exit(1)
-          lines = [l.strip() for l in cfg.splitlines()]
-          bad = [l for l in lines if l == "CONFIG_UBSAN_TRAP=y"]
-          good = [l for l in lines if l == "# CONFIG_UBSAN_TRAP is not set"]
-          if bad or not good:
-              print("::error::内核仍启用 UBSAN trap（CONFIG_UBSAN_TRAP=y）：厂商模块越界会直接整机重启")
-              sys.exit(1)
-          print("内嵌配置校验通过: " + good[0])
-          PYEOF
       - name: 应用 KPM 补丁（构建期修补 Image）
         if: startsWith(inputs.use_kpm, 'patched') && (inputs.ksu_variant == 'SukiSU' || inputs.ksu_variant == 'BakaSU')
         run: |
