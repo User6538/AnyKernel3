@@ -727,7 +727,7 @@ else:
         open(p, "w", encoding="utf-8", errors="surrogateescape").write(s.replace(old2, new2, 1))
         print("fs/susfs.c: 已加 SUSFS 路径隐藏 LOOP 回退")
 PYEOF
-  grep -n 'FINASU_SUS_PATH_LOOP_FALLBACK' fs/susfs.c | head
+  grep -n 'FINASU_SUS_PATH_LOOP_FALLBACK' fs/susfs.c | head || true
 else
   echo "::warning::未找到 fs/susfs.c 的 susfs_add_sus_path，跳过路径隐藏回退"
 fi
@@ -893,7 +893,7 @@ if new_text.count("/*") - src.count("/*") != 1 or new_text.count("*/") - src.cou
 open(P, "w", encoding="utf-8", errors="surrogateescape").write(new_text)
 print("fs/susfs.c: sus_path 身份校验已写入 (add=%d, guard=%d)" % (added, guarded))
 PYEOF
-  grep -n 'FINASU_SUS_PATH_ID_GUARD' fs/susfs.c | head
+  grep -n 'FINASU_SUS_PATH_ID_GUARD' fs/susfs.c | head || true
 else
   echo "::warning::fs/susfs.c 未匹配 sus_path 身份校验修复条件（sus_path 代码形态不符），跳过"
 fi
@@ -1152,7 +1152,14 @@ if _d.count("/*") < 1 or _d.count("*/") < 1:
     print("::error::机制段未写入或注释标记异常，可能触发 -Wcomment，已中止")
     raise SystemExit(1)
 PYEOF
-  grep -rn 'FINASU_SUS_FLAGS_ID_GUARD' fs/susfs.c KernelSU/kernel/extension/susfs.c 2>/dev/null | head
+  # 仅作信息输出：内建集成宿主可能不存在（如 SukiSU builtin 树），这里只 grep 实际存在的文件。
+  # 若按原写法把不存在的路径交给 grep，grep 会以 2 退出；本行位于 if 分支体内，在 set -eo pipefail
+  # 下整个补丁步骤会以 exit 2 静默中断（stderr 被吞掉，日志里只剩输出、没有报错）。
+  for _host in fs/susfs.c KernelSU/kernel/extension/susfs.c; do
+    if [ -f "$_host" ]; then
+      grep -n 'FINASU_SUS_FLAGS_ID_GUARD' "$_host" | head || true
+    fi
+  done
 else
   echo "::warning::内建集成宿主未就绪或已应用扩展身份校验，跳过"
 fi
