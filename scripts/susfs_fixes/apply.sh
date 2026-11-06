@@ -1052,18 +1052,24 @@ for M in MACROS:
 
     def ins_set(m):
         ind, expr, sep = m.group(1), m.group(2), m.group(3)
+        arg = "&" + expr if expr == "fi->inode" else expr
         return ("%sset_bit(%s, &%s%si_mapping->flags);\n%ssusfs_sus_flags_id_add(%s, %s);"
-                % (ind, M, expr, sep, ind, expr, M))
+                % (ind, M, expr, sep, ind, arg, M))
 
     text = re.sub(set_pat, ins_set, text, flags=re.M)
 
     def wrap_test(m):
         expr, sep = m.group(1), m.group(2)
+        arg = "&" + expr if expr == "fi->inode" else expr
         return ("(test_bit(%s, &%s%si_mapping->flags) && susfs_sus_flags_id_match(%s, %s))"
-                % (M, expr, sep, expr, M))
+                % (M, expr, sep, arg, M))
 
     text = re.sub(test_pat, wrap_test, text)
     report.append((M, n_set, n_test))
+if re.search(r'susfs_sus_flags_id_(?:add|match)\(fi->inode,', text):
+    print("::error::存在未取址的 fi->inode 传参（应为 &fi->inode），已中止")
+    raise SystemExit(1)
+
 if sum(r[2] for r in report) == 0:
     print("::error::本树未匹配到任何同族判定点，形态与预期不符，已中止")
     raise SystemExit(1)
