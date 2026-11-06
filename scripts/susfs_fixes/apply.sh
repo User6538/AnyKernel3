@@ -920,7 +920,12 @@ import os, re, sys
 MARK = "FINASU_SUS_FLAGS_ID_GUARD"
 DEF_FILE = "fs/susfs.c"
 MACROS = ["AS_FLAGS_SUS_MOUNT", "AS_FLAGS_SUS_KSTAT", "AS_FLAGS_OPEN_REDIRECT", "AS_FLAGS_SUS_MAP"]
-EXPR = r'&(fi->inode|inode)(\.|->)i_mapping->flags'
+# 变量名不再写死为 inode / fi->inode：上游同一版本里 OPEN_REDIRECT 的登记点用的是
+# redirected_inode / target_inode（见 fs/susfs.c 的 susfs_add_open_redirect），
+# 只认 inode 会把「有判定、无登记」误判成「没有使用点」而整体跳过。
+# 登记/判定两侧都按同一捕获组取值，改写时仍沿用捕获到的同一变量，取址规则不变：
+# fi->inode -> &fi->inode；inode 与其它标识符本身就是 inode 指针，不取址。
+EXPR = r'&(fi->inode|inode|[A-Za-z_][A-Za-z0-9_]*)(\.|->)i_mapping->flags'
 SET_RE = r'^([ \t]*)set_bit\((M), ' + EXPR + r'\);[ \t]*$'
 TEST_RE = r'test_bit\((M), ' + EXPR + r'\)'
 
@@ -970,6 +975,20 @@ for m in MACROS:
 
 guardable = [m for m in MACROS if counts[m][1] > 0 and counts[m][0] > 0]
 skip = [m for m in MACROS if m not in guardable]
+
+
+def report_skip(m):
+    ns, nt = counts[m]
+    if ns == 0 and nt == 0:
+        print("::warning::%s 全树未见使用点，已跳过（该位由构建期位占用校验兜底）" % m)
+    elif ns > 0 and nt == 0:
+        print("::warning::%s 只有登记点、没有判定点（登记=%d 判定=0），跳过（该位由构建期位占用校验兜底）"
+              % (m, ns))
+    else:
+        print("::warning::%s 只有判定点、没有登记点（登记=%d 判定=%d），跳过以免削弱功能"
+              "（登记点写法可能未被识别，该位由构建期位占用校验兜底）" % (m, ns, nt))
+
+
 
 MACHINERY = '''
 /* ''' + MARK + ''' 说明：SUSFS 把语义标志写进内核既有字段的空闲位，但该位并非 SUSFS 独占
@@ -1054,8 +1073,7 @@ if MACHINERY.count("/*") != 1 or MACHINERY.count("*/") != 1:
 
 if not guardable:
     for m in MACROS:
-        print("::warning::%s 未见成对的登记与判定（登记=%d 判定=%d），跳过（该位由构建期位占用校验兜底）"
-              % (m, counts[m][0], counts[m][1]))
+        report_skip(m)
     raise SystemExit(0)
 
 if DEF_FILE not in texts:
@@ -1134,14 +1152,11 @@ for p, src in texts.items():
 merged = {}
 for m in MACROS:
     hits = [r for r in report if r[0] == m]
-    if not hits:
-        print("::warning::%s 全树未见使用点，已跳过（该位由构建期位占用校验兜底）" % m)
-    elif m in guardable:
+    if m in guardable:
         print("已守卫 %s：登记 %d 处、判定 %d 处，涉及 %d 个文件"
               % (m, sum(h[2] for h in hits), sum(h[3] for h in hits), len(hits)))
     else:
-        print("::warning::%s 登记与判定不成对（登记=%d 判定=%d），跳过以免削弱功能"
-              % (m, counts[m][0], counts[m][1]))
+        report_skip(m)
 
 for p, src in texts.items():
     if re.search(r'susfs_sus_flags_id_(?:add|match)\(fi->inode,', src):
