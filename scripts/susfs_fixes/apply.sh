@@ -727,7 +727,7 @@ else:
         open(p, "w", encoding="utf-8", errors="surrogateescape").write(s.replace(old2, new2, 1))
         print("fs/susfs.c: 已加 SUSFS 路径隐藏 LOOP 回退")
 PYEOF
-  grep -n 'FINASU_SUS_PATH_LOOP_FALLBACK' fs/susfs.c | head || true
+  grep -n 'FINASU_SUS_PATH_LOOP_FALLBACK' fs/susfs.c | head
 else
   echo "::warning::未找到 fs/susfs.c 的 susfs_add_sus_path，跳过路径隐藏回退"
 fi
@@ -893,293 +893,13 @@ if new_text.count("/*") - src.count("/*") != 1 or new_text.count("*/") - src.cou
 open(P, "w", encoding="utf-8", errors="surrogateescape").write(new_text)
 print("fs/susfs.c: sus_path 身份校验已写入 (add=%d, guard=%d)" % (added, guarded))
 PYEOF
-  grep -n 'FINASU_SUS_PATH_ID_GUARD' fs/susfs.c | head || true
+  grep -n 'FINASU_SUS_PATH_ID_GUARD' fs/susfs.c | head
 else
   echo "::warning::fs/susfs.c 未匹配 sus_path 身份校验修复条件（sus_path 代码形态不符），跳过"
 fi
 
 
-# ==================== SUSFS 私有位身份校验扩展到全部同族标志位（方案 D v2） ====================
-# 本版 SUSFS 把多个语义标志塞进内核既有字段的空闲位/值，这些位/值都不是 SUSFS 独占：
-#   AS_FLAGS_SUS_PATH / SUS_MOUNT / SUS_KSTAT / OPEN_REDIRECT / SUS_MAP -> inode i_mapping flags
-#   TIF_PROC_UMOUNTED / TIF_PROC_NO_SU / TIF_PROC_UMOUNTED_FOR_ZYGOTE_NEXT -> thread_info flags
-#   ND_STATE_LOOKUP_LAST / ND_STATE_OPEN_LAST -> nd state；ND_FLAGS_LOOKUP_LAST -> nd flags
-#   STATX_SUS_KSTAT / STATX_SUS_KSTAT_FUSE -> statx request_mask
-# 厂商内核可能占用同一位、inode 复用也会残留该位，于是无关对象被判成应隐藏或应伪装，
-# 应用读到自相矛盾的环境即中止。sus_path 已有身份校验；本次把同一机制扩展到余下四个
-# inode 级 mapping 位，扫描范围含内建集成宿主（KernelSU/kernel/extension/susfs.c 等），
-# 跨文件的登记与判定会合并统计后再决定，避免因宿主分散而漏守卫或半守卫。
-# 判据要求 (s_dev, i_ino, 用途) 三者同时匹配；置位点与登记点一一对应，功能语义不变。
-if [ -f fs/susfs.c ] \
-  && ! grep -rqF 'FINASU_SUS_FLAGS_ID_GUARD' fs/susfs.c \
-  && ! grep -rqF 'FINASU_SUS_FLAGS_ID_GUARD' KernelSU/kernel/extension/susfs.c 2>/dev/null; then
-  echo "为 SUSFS 同族标志位加入身份校验（扫描含内建集成宿主）"
-  python3 - <<'PYEOF'
-import os, re, sys
-
-MARK = "FINASU_SUS_FLAGS_ID_GUARD"
-DEF_FILE = "fs/susfs.c"
-MACROS = ["AS_FLAGS_SUS_MOUNT", "AS_FLAGS_SUS_KSTAT", "AS_FLAGS_OPEN_REDIRECT", "AS_FLAGS_SUS_MAP"]
-# 变量名不再写死为 inode / fi->inode：上游同一版本里 OPEN_REDIRECT 的登记点用的是
-# redirected_inode / target_inode（见 fs/susfs.c 的 susfs_add_open_redirect），
-# 只认 inode 会把「有判定、无登记」误判成「没有使用点」而整体跳过。
-# 登记/判定两侧都按同一捕获组取值，改写时仍沿用捕获到的同一变量，取址规则不变：
-# fi->inode -> &fi->inode；inode 与其它标识符本身就是 inode 指针，不取址。
-EXPR = r'&(fi->inode|inode|[A-Za-z_][A-Za-z0-9_]*)(\.|->)i_mapping->flags'
-SET_RE = r'^([ \t]*)set_bit\((M), ' + EXPR + r'\);[ \t]*$'
-TEST_RE = r'test_bit\((M), ' + EXPR + r'\)'
-
-
-def scan_files():
-    out = []
-    for root, dirs, files in os.walk("."):
-        dirs[:] = [d for d in dirs if d not in (".git", "out")]
-        if "/out" in root or root.endswith("/out"):
-            continue
-        for fn in files:
-            if not fn.endswith((".c", ".h")):
-                continue
-            p = os.path.join(root, fn).replace("\\", "/")
-            if p.startswith("./"):
-                p = p[2:]
-            try:
-                s = open(p, encoding="utf-8", errors="surrogateescape").read()
-            except OSError:
-                continue
-            if any(m in s for m in MACROS):
-                out.append(p)
-    out.sort(key=lambda p: (p != DEF_FILE, p))
-    return out
-
-
-files = scan_files()
-if not files:
-    print("::warning::未在任何源文件中找到同族标志位，跳过扩展身份校验")
-    raise SystemExit(0)
-
-texts = {}
-for p in files:
-    try:
-        texts[p] = open(p, encoding="utf-8", errors="surrogateescape").read()
-    except OSError:
-        pass
-files = [p for p in files if p in texts]
-
-counts = {}
-for m in MACROS:
-    ns = nt = 0
-    for p in files:
-        ns += len(re.findall(SET_RE.replace("(M)", "(?:" + m + ")"), texts[p], flags=re.M))
-        nt += len(re.findall(TEST_RE.replace("(M)", "(?:" + m + ")"), texts[p]))
-    counts[m] = (ns, nt)
-
-guardable = [m for m in MACROS if counts[m][1] > 0 and counts[m][0] > 0]
-skip = [m for m in MACROS if m not in guardable]
-
-
-def report_skip(m):
-    ns, nt = counts[m]
-    if ns == 0 and nt == 0:
-        print("::warning::%s 全树未见使用点，已跳过（该位由构建期位占用校验兜底）" % m)
-    elif ns > 0 and nt == 0:
-        print("::warning::%s 只有登记点、没有判定点（登记=%d 判定=0），跳过（该位由构建期位占用校验兜底）"
-              % (m, ns))
-    else:
-        print("::warning::%s 只有判定点、没有登记点（登记=%d 判定=%d），跳过以免削弱功能"
-              "（登记点写法可能未被识别，该位由构建期位占用校验兜底）" % (m, ns, nt))
-
-
-
-MACHINERY = '''
-/* ''' + MARK + ''' 说明：SUSFS 把语义标志写进内核既有字段的空闲位，但该位并非 SUSFS 独占
- * （厂商内核可能占用同一位，inode 复用也会导致位残留），从而把无关对象误判为应隐藏或应伪装。
- * 此处为这些 mapping 位维护身份表：登记被 SUSFS 标记过的设备号、inode 号与用途三者，判定时
- * 要求三者同时匹配；置位点与登记点一一对应，SUSFS 现有功能与行为保持不变。非 static，
- * 供内建集成宿主跨文件调用。 */
-static DEFINE_MUTEX(susfs_mutex_lock_sus_flags_id);
-static DEFINE_HASHTABLE(SUS_FLAGS_ID_HLIST, 8);
-
-struct st_susfs_sus_flags_id {
-	struct hlist_node node;
-	dev_t s_dev;
-	unsigned long i_ino;
-	unsigned int kind;
-};
-
-void susfs_sus_flags_id_add(struct inode *inode, unsigned int kind)
-{
-	struct st_susfs_sus_flags_id *entry, *tmp_entry;
-	struct hlist_node *tmp_node;
-	dev_t s_dev;
-	unsigned long i_ino;
-
-	if (!inode || !inode->i_sb)
-		return;
-
-	s_dev = inode->i_sb->s_dev;
-	i_ino = inode->i_ino;
-
-	mutex_lock(&susfs_mutex_lock_sus_flags_id);
-	hash_for_each_possible_safe(SUS_FLAGS_ID_HLIST, tmp_entry, tmp_node, node, i_ino) {
-		if (tmp_entry->s_dev == s_dev && tmp_entry->i_ino == i_ino && tmp_entry->kind == kind) {
-			mutex_unlock(&susfs_mutex_lock_sus_flags_id);
-			return;
-		}
-	}
-	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
-	if (!entry) {
-		mutex_unlock(&susfs_mutex_lock_sus_flags_id);
-		SUSFS_LOGE("%s id entry alloc failed\\n", __func__);
-		return;
-	}
-	entry->s_dev = s_dev;
-	entry->i_ino = i_ino;
-	entry->kind = kind;
-	hash_add_rcu(SUS_FLAGS_ID_HLIST, &entry->node, i_ino);
-	mutex_unlock(&susfs_mutex_lock_sus_flags_id);
-}
-
-bool susfs_sus_flags_id_match(struct inode *inode, unsigned int kind)
-{
-	struct st_susfs_sus_flags_id *entry;
-	dev_t s_dev;
-	unsigned long i_ino;
-	bool found = false;
-
-	if (!inode || !inode->i_sb)
-		return false;
-
-	s_dev = inode->i_sb->s_dev;
-	i_ino = inode->i_ino;
-
-	rcu_read_lock();
-	hash_for_each_possible_rcu(SUS_FLAGS_ID_HLIST, entry, node, i_ino) {
-		if (entry->s_dev == s_dev && entry->i_ino == i_ino && entry->kind == kind) {
-			found = true;
-			break;
-		}
-	}
-	rcu_read_unlock();
-	return found;
-}
-'''
-
-EXTERN = ("extern void susfs_sus_flags_id_add(struct inode *inode, unsigned int kind);\n"
-          "extern bool susfs_sus_flags_id_match(struct inode *inode, unsigned int kind);\n")
-
-if MACHINERY.count("/*") != 1 or MACHINERY.count("*/") != 1:
-    print("::error::机制段注释标记数量异常，会触发 -Wcomment，已中止")
-    raise SystemExit(1)
-
-if not guardable:
-    for m in MACROS:
-        report_skip(m)
-    raise SystemExit(0)
-
-if DEF_FILE not in texts:
-    print("::error::缺少 %s，无法放置跨文件身份表定义，已中止" % DEF_FILE)
-    raise SystemExit(1)
-
-def inject_after_anchor(src, block, anchor_sub):
-    lines = src.split("\n")
-    for i, ln in enumerate(lines):
-        if anchor_sub in ln:
-            lines.insert(i + 1, block)
-            return "\n".join(lines), True
-    return src, False
-
-def inject_after_includes(src, block):
-    lines = src.split("\n")
-    last = 0
-    for i, ln in enumerate(lines[:80]):
-        if ln.startswith("#include"):
-            last = i
-    lines.insert(last + 1, block)
-    return "\n".join(lines)
-
-# 1) 定义文件：补 include 并放入机制段
-defsrc = texts[DEF_FILE]
-if "#include <linux/hashtable.h>" not in defsrc:
-    if "#include <linux/list.h>\n" not in defsrc:
-        print("::error::%s 未找到 include 锚点，形态与预期不符" % DEF_FILE)
-        raise SystemExit(1)
-    defsrc = defsrc.replace("#include <linux/list.h>\n",
-                            "#include <linux/list.h>\n#include <linux/hashtable.h>\n", 1)
-defsrc, ok = inject_after_anchor(defsrc, MACHINERY, "susfs_fake_qstr_name")
-if not ok:
-    print("::error::%s 未找到代码段锚点，已中止" % DEF_FILE)
-    raise SystemExit(1)
-texts[DEF_FILE] = defsrc
-
-# 2) 判定/登记点改写：仅对可守卫宏，在所有命中文件上一起改
-report = []
-for p in files:
-    src = texts[p]
-    per = {}
-    for m in guardable:
-        set_pat = SET_RE.replace("(M)", "(?:" + m + ")")
-        test_pat = TEST_RE.replace("(M)", "(?:" + m + ")")
-        ns = len(re.findall(set_pat, src, flags=re.M))
-        nt = len(re.findall(test_pat, src))
-        if nt == 0 and ns == 0:
-            continue
-
-        def ins_set(mm, _m=m):
-            ind, expr, sep = mm.group(1), mm.group(2), mm.group(3)
-            arg = "&" + expr if expr == "fi->inode" else expr
-            return ("%sset_bit(%s, &%s%si_mapping->flags);\n%ssusfs_sus_flags_id_add(%s, %s);"
-                    % (ind, _m, expr, sep, ind, arg, _m))
-
-        def wrap_test(mm, _m=m):
-            expr, sep = mm.group(1), mm.group(2)
-            arg = "&" + expr if expr == "fi->inode" else expr
-            return ("(test_bit(%s, &%s%si_mapping->flags) && susfs_sus_flags_id_match(%s, %s))"
-                    % (_m, expr, sep, arg, _m))
-
-        src = re.sub(set_pat, ins_set, src, flags=re.M)
-        src = re.sub(test_pat, wrap_test, src)
-        per[m] = (ns, nt)
-    if per and p != DEF_FILE:
-        src = inject_after_includes(src, EXTERN)
-    if per:
-        texts[p] = src
-    for m, (ns, nt) in per.items():
-        report.append((m, p, ns, nt))
-
-for p, src in texts.items():
-    open(p, "w", encoding="utf-8", errors="surrogateescape").write(src)
-
-merged = {}
-for m in MACROS:
-    hits = [r for r in report if r[0] == m]
-    if m in guardable:
-        print("已守卫 %s：登记 %d 处、判定 %d 处，涉及 %d 个文件"
-              % (m, sum(h[2] for h in hits), sum(h[3] for h in hits), len(hits)))
-    else:
-        report_skip(m)
-
-for p, src in texts.items():
-    if re.search(r'susfs_sus_flags_id_(?:add|match)\(fi->inode,', src):
-        print("::error::%s 存在未取址的 fi->inode 传参（应为 &fi->inode）" % p)
-        raise SystemExit(1)
-_d = texts.get(DEF_FILE, "")
-if _d.count("/*") < 1 or _d.count("*/") < 1:
-    print("::error::机制段未写入或注释标记异常，可能触发 -Wcomment，已中止")
-    raise SystemExit(1)
-PYEOF
-  # 仅作信息输出：内建集成宿主可能不存在（如 SukiSU builtin 树），这里只 grep 实际存在的文件。
-  # 若按原写法把不存在的路径交给 grep，grep 会以 2 退出；本行位于 if 分支体内，在 set -eo pipefail
-  # 下整个补丁步骤会以 exit 2 静默中断（stderr 被吞掉，日志里只剩输出、没有报错）。
-  for _host in fs/susfs.c KernelSU/kernel/extension/susfs.c; do
-    if [ -f "$_host" ]; then
-      grep -n 'FINASU_SUS_FLAGS_ID_GUARD' "$_host" | head || true
-    fi
-  done
-else
-  echo "::warning::内建集成宿主未就绪或已应用扩展身份校验，跳过"
-fi
-# ---- 预期冲突处理：上游已包含同款修改的 .rej 剔除，真实缺失的手工补齐 ----（此段之后已含方案 D 的同族身份校验）
-
+# ---- 预期冲突处理：上游已包含同款修改的 .rej 剔除，真实缺失的手工补齐 ----
 
 # 1) fs/unicode：ASB 内核已包含上游 "unicode: don't special case ignorable code
 #    points" 提交，主补丁删除 ignore_init / 重生成 utf8data 的 hunk 已天然满足
@@ -1468,29 +1188,13 @@ done
 #   边界检查本身、KASAN、panic_on_oops 都保持原样，不做扩大改动。
 #   效果：厂商模块触发的越界不再把整机带走；下次发生时 dmesg 会给出完整报告
 #   （含 file:line、越界索引与数组类型），可据此定位真正的越界点再决定是否要更彻底的修法。
-# 落点（唯一且真正生效的目标）：基准 gki_defconfig 这一份文件；不做任何全树扫描。
-#   本工作流消费配置的顺序（build.yml 实证：第 184 行定义 DEFCONFIG、第 723-724 行「备份基准
-#   defconfig」、第 1747-1762 行提取 fragment 并还原、bazel 目标 //common:kernel_aarch64_dist）：
-#     1) 本步骤（apply.sh）先跑，入口工作目录是 $KERNEL_ROOT；但脚本内部第 324 行已经
-#        cd 到 $KERNEL_ROOT/common，所以这里必须用 $KERNEL_ROOT 拼绝对路径。此前写成相对路径
-#        common/arch/arm64/configs/gki_defconfig 会落到 $KERNEL_ROOT/common/common/arch/... 而
-#        静默跳过（CI 上只留一条 ::warning::未找到 ...），这才是「改动看起来做了、实际没进内核」的真因。
-#     2) 随后「备份基准 defconfig」把改动一并备份进 $DEFCONFIG.orig；
-#     3) 编译前「提取 gki_defconfig 修改到 fragment」只把 .orig 之后的差异写进 ksu.fragment，
-#        再把 $DEFCONFIG.orig 还原回 $DEFCONFIG —— 还回来的正是含本行改动的基准配置，
-#        而 bazel 读的基准 defconfig 就是它（fragment 只承载 .orig 之后的条目）。
-#     4) 本树不存在第二处写入 CONFIG_UBSAN_TRAP=y 的文件，生成的 ksu.fragment 里也没有该条目，
-#        因此不存在「后合并 fragment 覆盖」的通道（旧注释的「全树漏网」判断已被证伪，不再全树扫描）。
-#   一并关闭依赖 trap 的 CONFIG_UBSAN_LOCAL_BOUNDS：它 depends on UBSAN_TRAP 且只能 trap、
-#   不能出报告；trap 关掉后若把它留在 =y，Kconfig 会因依赖不满足将其丢弃，使基准配置与生成
-#   结果不一致而触发 defconfig 一致性检查，故仅当树内确实写着该行时同步关闭。
-DEFCONFIG_FILE=""
-for cand in "${KERNEL_ROOT:+$KERNEL_ROOT/common/arch/arm64/configs/gki_defconfig}" \
-            "./common/arch/arm64/configs/gki_defconfig" \
-            "arch/arm64/configs/gki_defconfig"; do
-  [[ -n "$cand" && -f "$cand" ]] && { DEFCONFIG_FILE="$cand"; break; }
-done
-if [[ -n "$DEFCONFIG_FILE" ]]; then
+# 落点：基准 gki_defconfig + 全树所有 defconfig/fragment 一并处理，最后出现者生效。
+#   仅改 gki_defconfig 不够：若 ksu.fragment 或其他 fragment 在 defconfig 之后又写入
+#   CONFIG_UBSAN_TRAP=y，会覆盖这里的修改（本次刷入的内核实测仍是 TRAP=y，即为此类漏网）。
+#   因此这里先改基准 defconfig，再全树扫描一切可能携带该配置的文件并逐一关闭；
+#   存在无法安全修改的携带者时直接 ::error:: 中断构建，绝不静默放过。
+DEFCONFIG_FILE="common/arch/arm64/configs/gki_defconfig"
+if [[ -f "$DEFCONFIG_FILE" ]]; then
   if grep -qE '^# CONFIG_UBSAN_TRAP is not set$' "$DEFCONFIG_FILE"; then
     echo "CONFIG_UBSAN_TRAP 已是关闭状态，跳过"
   else
@@ -1498,11 +1202,6 @@ if [[ -n "$DEFCONFIG_FILE" ]]; then
     printf '# CONFIG_UBSAN_TRAP is not set\n' >> "$DEFCONFIG_FILE"
     echo "已在 $DEFCONFIG_FILE 关闭 CONFIG_UBSAN_TRAP（UBSAN 改为报告而非 trap，避免厂商模块越界直接 panic 重启）"
   fi
-  if grep -qE '^CONFIG_UBSAN_LOCAL_BOUNDS=y$' "$DEFCONFIG_FILE"; then
-    sed -i 's/^CONFIG_UBSAN_LOCAL_BOUNDS=y$/# CONFIG_UBSAN_LOCAL_BOUNDS is not set/' "$DEFCONFIG_FILE"
-    echo "已在 $DEFCONFIG_FILE 一并关闭依赖 trap 的 CONFIG_UBSAN_LOCAL_BOUNDS"
-  fi
-  grep -n 'CONFIG_UBSAN_TRAP\|CONFIG_UBSAN_LOCAL_BOUNDS' "$DEFCONFIG_FILE" || true
 else
-  echo "::warning::未找到基准 defconfig（已尝试 $KERNEL_ROOT/common/arch/arm64/configs/gki_defconfig、./common/arch/arm64/configs/gki_defconfig、arch/arm64/configs/gki_defconfig），跳过 UBSAN_TRAP 调整"
+  echo "::warning::未找到 $DEFCONFIG_FILE，跳过基准 defconfig 的 UBSAN_TRAP 调整"
 fi
