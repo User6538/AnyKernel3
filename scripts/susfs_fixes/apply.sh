@@ -733,7 +733,7 @@ else
 fi
 
 
-# ==================== SUSFS sus_path 误伤修复（共用位域 -> 身份校验） ====================
+# ==================== SUSFS sus_path 误伤根治（弃用共用位域 -> 私有身份表） ====================
 # 背景：本版 SUSFS 用 inode->i_mapping->flags 的第 33 位（AS_FLAGS_SUS_PATH）承载 sus_path 判定
 # 结果，并在各 VFS 入口用 susfs_is_inode_sus_path() 检查。该位并非 SUSFS 独占：厂商内核可能
 # 使用同一位，或因 inode/address_space 复用而残留该位。一旦与 SUSFS 无关的文件带上该位，就会被
@@ -743,14 +743,24 @@ fi
 # 实测（vivo V2507A / android15 6.6.57）：内核整段启动日志（t=0 起）中不存在任何
 # flagged/re-flag AS_FLAGS_SUS_PATH 或 CMD_SUSFS_ADD_SUS_PATH 记录（sus_path 列表为空），
 # 却仍对应用自身的 6 个 APK 输出 hiding 判定 —— 属杂散置位误判，而非配置出来的隐藏规则。
-# 修复：sus_path 判定除该位外，还要求该 inode 的 (s_dev, i_ino) 已被 SUSFS 登记；杂散置位不再
-# 误伤。SUSFS 与 SUS_PATH 的功能、行为均保持不变（置位点与登记点一一对应）。
+# 根治（双向隔离）：该位的污染是双向的 —— 别人置位会误伤 SUSFS 的判定，SUSFS 置位也可能
+# 改写厂商赋予同一位的含义（数据错乱比崩溃更难查）。因此这里不再读写该位：
+#   1. 被标记对象的身份 (s_dev, ident, i_generation) 存进 SUSFS 自己的哈希表，判定改为查表；
+#      FUSE 用 fi->nodeid（i_ino 可能恒为 0），非 FUSE 用 i_ino 并辅以 i_generation 防 inode
+#      号复用冒名；
+#   2. 所有 set_bit(AS_FLAGS_SUS_PATH) 置位点原地替换为登记调用，所有 test_bit 判定点原地
+#      替换为查表调用 —— fs/susfs.c 内不再存在对该位的任何读写；
+#   3. 未登记任何 sus_path 时（用户没配置路径隐藏的常态），判定只读一个原子计数即返回，
+#      VFS 热路径开销可忽略；
+#   4. 改写后全树扫描确认 AS_FLAGS_SUS_PATH 的位操作只存在于 fs/susfs.c（若有残留即报错
+#      中断，防止漏改导致语义分叉）。
+# SUSFS 与 SUS_PATH 的功能、行为均保持不变（置位点与登记点一一对应）。
 if [ -f fs/susfs.c ] && grep -qF 'test_bit(AS_FLAGS_SUS_PATH,' fs/susfs.c \
   && grep -qF 'set_bit(AS_FLAGS_SUS_PATH,' fs/susfs.c \
   && ! grep -qF 'FINASU_SUS_PATH_ID_GUARD' fs/susfs.c; then
-  echo "为 sus_path 判定加入身份校验（消除共用位域误伤）"
+  echo "为 sus_path 判定加入私有身份表（与共用位域彻底解耦）"
   python3 - <<'PYEOF'
-import sys
+import os, re, sys
 
 P = "fs/susfs.c"
 src = open(P, encoding="utf-8", errors="surrogateescape").read()
@@ -764,76 +774,113 @@ if "test_bit(AS_FLAGS_SUS_PATH," not in src or "set_bit(AS_FLAGS_SUS_PATH," not 
     raise SystemExit(1)
 
 GUARD = '''
-/* FINASU_SUS_PATH_ID_GUARD: sus_path 的判定原本只看 i_mapping->flags 第 33 位
+/* FINASU_SUS_PATH_ID_GUARD: sus_path 的判定原本只读写 i_mapping->flags 的第 33 位
  * (AS_FLAGS_SUS_PATH)。该位不是 SUSFS 独占的：厂商内核可能使用同一位，或因
  * inode/address_space 复用而残留，从而把与 SUSFS 无关的文件误判成隐藏路径
- * （实测应用自身在 /data/app 下的 APK 被误伤，应用启动即 NPE 崩溃）。
- * 这里为 sus_path 增加身份表：登记被 SUSFS 标记过的 (s_dev, i_ino)，判定时要求身份
- * 匹配，杂散置位不再误伤；SUSFS 的置位点与登记点一一对应，功能语义不变。 */
-static DEFINE_MUTEX(susfs_mutex_lock_sus_path_id);
-static DEFINE_HASHTABLE(SUS_PATH_ID_HLIST, 8);
+ * （实测应用自身在 /data/app 下的 APK 被误伤，应用启动即 NPE 崩溃）；反过来，
+ * SUSFS 置位也会改写厂商赋予同一位的含义。这里与该位彻底解耦：被 SUSFS 标记过的
+ * 对象身份全部登记进本表，判定改为查表，不再对该位做任何读写。 */
+static atomic_t susfs_sus_path_key_count = ATOMIC_INIT(0);
+static DEFINE_SPINLOCK(susfs_spin_lock_sus_path_key);
+static DEFINE_HASHTABLE(SUS_PATH_KEY_HLIST, 10);
 
-struct st_susfs_sus_path_id {
+struct st_susfs_sus_path_key {
 	struct hlist_node node;
 	dev_t s_dev;
-	unsigned long i_ino;
-	// i_ino 为 0 时（实测 FUSE 下的 /sdcard/Android/data/<pkg> 即如此）单看
-	// (s_dev, i_ino) 会把同一 sb 上所有 i_ino 为 0 的 inode 认成同一个对象，
-	// 身份校验等于失效；这种情形再要求 inode 地址相同（只比较指针，不解引用）。
-	struct inode *inode;
+	u64 ident;			// FUSE 取 nodeid，其余取 i_ino
+	u32 i_generation;		// 非 FUSE：inode 号复用后 generation 会变，防冒名
+	bool is_fuse;
 };
+
+// 身份键：FUSE 用 fi->nodeid（该类 inode 的 i_ino 可能恒为 0）；其余用 i_ino
+// 并辅以 i_generation。取不到非零身份的（ino 与 nodeid 均为 0）不登记也不判定，
+// 宁可漏隐藏也不误伤。
+static u64 susfs_sus_path_key_ident(struct inode *inode, u32 *i_generation, bool *is_fuse)
+{
+	struct fuse_inode *fi;
+
+	*i_generation = 0;
+	*is_fuse = false;
+	if (inode->i_sb->s_magic == FUSE_SUPER_MAGIC) {
+		fi = get_fuse_inode(inode);
+		if (fi && fi->nodeid) {
+			*is_fuse = true;
+			return (u64)fi->nodeid;
+		}
+	}
+	*i_generation = (u32)inode->i_generation;
+	return (u64)inode->i_ino;
+}
 
 static void susfs_sus_path_id_add(struct inode *inode)
 {
-	struct st_susfs_sus_path_id *entry, *tmp_entry;
+	struct st_susfs_sus_path_key *key, *tmp_key;
 	struct hlist_node *tmp_node;
-	dev_t s_dev;
-	unsigned long i_ino;
+	unsigned long irq_flags;
+	u32 i_generation;
+	bool is_fuse;
+	u64 ident;
 
 	if (!inode || !inode->i_sb)
 		return;
 
-	s_dev = inode->i_sb->s_dev;
-	i_ino = inode->i_ino;
+	ident = susfs_sus_path_key_ident(inode, &i_generation, &is_fuse);
+	if (!ident) {
+		SUSFS_LOGE("no stable identity for sus_path object, skip registering\\n");
+		return;
+	}
 
-	mutex_lock(&susfs_mutex_lock_sus_path_id);
-	hash_for_each_possible_safe(SUS_PATH_ID_HLIST, tmp_entry, tmp_node, node, i_ino) {
-		if (tmp_entry->s_dev == s_dev && tmp_entry->i_ino == i_ino
-		    && (i_ino != 0 || tmp_entry->inode == inode)) {
-			mutex_unlock(&susfs_mutex_lock_sus_path_id);
+	// 自旋锁 + GFP_ATOMIC：不假设置位点一定可睡眠，任何上下文都可安全调用；
+	// 登记是幂等的，重复调用只做查重后返回。
+	spin_lock_irqsave(&susfs_spin_lock_sus_path_key, irq_flags);
+	hash_for_each_possible_safe(SUS_PATH_KEY_HLIST, tmp_key, tmp_node, node, ident) {
+		if (tmp_key->ident == ident && tmp_key->s_dev == inode->i_sb->s_dev
+		    && tmp_key->is_fuse == is_fuse
+		    && (is_fuse || tmp_key->i_generation == i_generation)) {
+			spin_unlock_irqrestore(&susfs_spin_lock_sus_path_key, irq_flags);
 			return;
 		}
 	}
-	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
-	if (!entry) {
-		mutex_unlock(&susfs_mutex_lock_sus_path_id);
-		SUSFS_LOGE("sus_path id entry alloc failed\\n");
+	key = kzalloc(sizeof(*key), GFP_ATOMIC);
+	if (!key) {
+		spin_unlock_irqrestore(&susfs_spin_lock_sus_path_key, irq_flags);
+		SUSFS_LOGE("sus_path key entry alloc failed\\n");
 		return;
 	}
-	entry->s_dev = s_dev;
-	entry->i_ino = i_ino;
-	entry->inode = inode;
-	hash_add_rcu(SUS_PATH_ID_HLIST, &entry->node, i_ino);
-	mutex_unlock(&susfs_mutex_lock_sus_path_id);
+	key->s_dev = inode->i_sb->s_dev;
+	key->ident = ident;
+	key->i_generation = i_generation;
+	key->is_fuse = is_fuse;
+	hash_add_rcu(SUS_PATH_KEY_HLIST, &key->node, ident);
+	atomic_inc(&susfs_sus_path_key_count);
+	spin_unlock_irqrestore(&susfs_spin_lock_sus_path_key, irq_flags);
 }
 
 static bool susfs_sus_path_id_match(struct inode *inode)
 {
-	struct st_susfs_sus_path_id *entry;
-	dev_t s_dev;
-	unsigned long i_ino;
+	struct st_susfs_sus_path_key *key;
+	u32 i_generation;
+	bool is_fuse;
+	u64 ident;
 	bool found = false;
 
 	if (!inode || !inode->i_sb)
 		return false;
 
-	s_dev = inode->i_sb->s_dev;
-	i_ino = inode->i_ino;
+	// 常态短路：用户没配置任何路径隐藏时（绝大多数设备的常态），一次原子读即
+	// 返回 false，VFS 热路径开销可忽略；这正是杂散置位误伤最常发生的场景。
+	if (!atomic_read(&susfs_sus_path_key_count))
+		return false;
+
+	ident = susfs_sus_path_key_ident(inode, &i_generation, &is_fuse);
+	if (!ident)
+		return false;
 
 	rcu_read_lock();
-	hash_for_each_possible_rcu(SUS_PATH_ID_HLIST, entry, node, i_ino) {
-		if (entry->s_dev == s_dev && entry->i_ino == i_ino
-		    && (i_ino != 0 || entry->inode == inode)) {
+	hash_for_each_possible_rcu(SUS_PATH_KEY_HLIST, key, node, ident) {
+		if (key->ident == ident && key->s_dev == inode->i_sb->s_dev
+		    && key->is_fuse == is_fuse
+		    && (is_fuse || key->i_generation == i_generation)) {
 			found = true;
 			break;
 		}
@@ -845,66 +892,89 @@ static bool susfs_sus_path_id_match(struct inode *inode)
 # 自检：注释块里出现嵌套的 /* 或 */ 会被内核的 -Werror,-Wcomment 直接判为编译错误
 # （历史上就踩过：注释里写 "/data/app/*.apk" 时其中的 "/" + "*" 被当成嵌套注释）。
 if GUARD.count("/*") != 1 or GUARD.count("*/") != 1:
-    print("::error::身份校验注释块内含嵌套的 /* 或 */（内核以 -Werror,-Wcomment 构建会直接报错），请修正脚本内注释文字")
+    print("::error::身份表注释块内含嵌套的 /* 或 */（内核以 -Werror,-Wcomment 构建会直接报错），请修正脚本内注释文字")
     raise SystemExit(1)
 
 if "#include <linux/hashtable.h>" not in src:
     src = src.replace("#include <linux/list.h>\n",
                       "#include <linux/list.h>\n#include <linux/hashtable.h>\n", 1)
+if "#include <linux/atomic.h>" not in src:
+    src = src.replace("#include <linux/hashtable.h>\n",
+                      "#include <linux/atomic.h>\n#include <linux/hashtable.h>\n", 1)
+if "#include <linux/spinlock.h>" not in src:
+    src = src.replace("#include <linux/atomic.h>\n",
+                      "#include <linux/spinlock.h>\n#include <linux/atomic.h>\n", 1)
 
-lines = src.split("\n")
-out = []
-anchor = False
-added = 0
+# 先断言：该位在 fs/susfs.c 里只以 set_bit / test_bit 两种形态出现；其它形态
+# （clear_bit / test_and_set_bit 等）无法机械改写，直接报错而不是静默跳过。
+for m in re.finditer(r"[a-zA-Z_]+_bit\(\s*AS_FLAGS_SUS_PATH\b", src):
+    if m.group(0).split("(")[0] not in ("set_bit", "test_bit"):
+        print("::error::fs/susfs.c: AS_FLAGS_SUS_PATH 存在无法机械改写的位操作形态: %s" % m.group(0))
+        raise SystemExit(1)
 
-for line in lines:
-    out.append(line)
-    if not anchor and "susfs_fake_qstr_name" in line:
-        out.append(GUARD)
-        anchor = True
-        continue
-    if "set_bit(AS_FLAGS_SUS_PATH, &fi->inode.i_mapping->flags);" in line:
-        out.append(line[:len(line) - len(line.lstrip())] + "susfs_sus_path_id_add(&fi->inode);")
-        added += 1
-    elif "set_bit(AS_FLAGS_SUS_PATH, &inode->i_mapping->flags);" in line:
-        out.append(line[:len(line) - len(line.lstrip())] + "susfs_sus_path_id_add(inode);")
-        added += 1
+# 置位点原地替换为登记调用，判定点原地替换为查表调用 —— 改写后 fs/susfs.c 内
+# 不再存在对该位的任何读写（双向隔离）。
+new, n_set_fi = re.subn(r"\bset_bit\(AS_FLAGS_SUS_PATH,\s*&fi->inode\.i_mapping->flags\);",
+                        "susfs_sus_path_id_add(&fi->inode);", src)
+new, n_set_self = re.subn(r"\bset_bit\(AS_FLAGS_SUS_PATH,\s*&inode->i_mapping->flags\);",
+                          "susfs_sus_path_id_add(inode);", new)
+new, n_tst_fi = re.subn(r"\btest_bit\(AS_FLAGS_SUS_PATH,\s*&fi->inode\.i_mapping->flags\)",
+                        "susfs_sus_path_id_match(&fi->inode)", new)
+new, n_tst_self = re.subn(r"\btest_bit\(AS_FLAGS_SUS_PATH,\s*&inode->i_mapping->flags\)",
+                          "susfs_sus_path_id_match(inode)", new)
 
-if not anchor:
+added = n_set_fi + n_set_self
+guarded = n_tst_fi + n_tst_self
+if added < 2 or guarded < 2:
+    print("::error::fs/susfs.c: 置位/判定点数量不足 (add=%d, guard=%d)，形态与预期不符" % (added, guarded))
+    raise SystemExit(1)
+
+# 不允许残留任何对该位的位操作：置位已改登记、判定却还看位的话，语义直接分叉
+leftover = re.search(r"\b[a-zA-Z_]+_bit\(\s*AS_FLAGS_SUS_PATH\b", new)
+if leftover:
+    print("::error::fs/susfs.c: 仍存在未改写的位操作: %s" % leftover.group(0))
+    raise SystemExit(1)
+
+# 插入身份表机械代码（锚点与上游一致）
+anchor_idx = new.find("susfs_fake_qstr_name")
+if anchor_idx < 0:
     print("::error::fs/susfs.c: 未找到 sus_path 代码段锚点，跳过修复")
     raise SystemExit(1)
+anchor_end = new.find("\n", anchor_idx)
+new = new[:anchor_end + 1] + GUARD + new[anchor_end + 1:]
 
-pending = None
-guarded = 0
-
-for idx, line in enumerate(out):
-    if "test_bit(AS_FLAGS_SUS_PATH, &fi->inode.i_mapping->flags)" in line:
-        pending = "fuse"
-    elif "test_bit(AS_FLAGS_SUS_PATH, &inode->i_mapping->flags)" in line:
-        pending = "self"
-    elif pending and line.strip().startswith("is_i_uid_not_allowed(") and line.rstrip().endswith(")))"):
-        expr = "&fi->inode" if pending == "fuse" else "inode"
-        out[idx] = line.rstrip()[:-3] + ") && susfs_sus_path_id_match(" + expr + ")))"
-        guarded += 1
-        pending = None
-
-test_bit_total = "\n".join(out).count("test_bit(AS_FLAGS_SUS_PATH")
-if guarded != test_bit_total or guarded < 2:
-    print("::error::fs/susfs.c: 判定点未全部加上身份校验 (guard=%d, test_bit=%d)" % (guarded, test_bit_total))
-    raise SystemExit(1)
-if added < 2:
-    print("::error::fs/susfs.c: 未找到足够多的 sus_path 置位点 (add=%d)" % added)
-    raise SystemExit(1)
-if added != guarded:
-    print("::warning::fs/susfs.c: 置位点(%d)与判定点(%d)数量不等，对应关系可能已变化，请人工核对" % (added, guarded))
-
-new_text = "\n".join(out)
-if new_text.count("/*") - src.count("/*") != 1 or new_text.count("*/") - src.count("*/") != 1:
+# 写出前再校验注释标记：新增的 /* 与 */ 数量必须与 GUARD 内的成对一致
+if new.count("/*") - src.count("/*") != GUARD.count("/*") or new.count("*/") - src.count("*/") != GUARD.count("*/"):
     print("::error::fs/susfs.c: 写出内容引入的注释标记数量异常，可能触发 -Wcomment，已中止")
     raise SystemExit(1)
 
-open(P, "w", encoding="utf-8", errors="surrogateescape").write(new_text)
-print("fs/susfs.c: sus_path 身份校验已写入 (add=%d, guard=%d)" % (added, guarded))
+open(P, "w", encoding="utf-8", errors="surrogateescape").write(new)
+print("fs/susfs.c: sus_path 判定已改为私有身份表，不再读写 AS_FLAGS_SUS_PATH (add=%d, guard=%d)" % (added, guarded))
+
+# 全树扫描：确认 AS_FLAGS_SUS_PATH 的位操作只存在于 fs/susfs.c。判定改为查表后，
+# 其它文件（例如 include/linux/susfs.h 的内联宏）里对该位的读写会造成语义分叉，
+# 必须当错误暴露出来人工移植，而不是静默漏改。
+leak = []
+for root, dirs, files in os.walk("."):
+    dirs[:] = [d for d in dirs if d not in (".git", ".tmp_versions")]
+    for fn in files:
+        if not fn.endswith((".c", ".h")):
+            continue
+        path = os.path.join(root, fn)
+        rel = os.path.relpath(path, ".").replace(os.sep, "/")
+        if rel == "fs/susfs.c":
+            continue
+        try:
+            if os.path.getsize(path) > 6 * 1024 * 1024:
+                continue
+            text = open(path, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        if re.search(r"\b[a-zA-Z_]+_bit\(\s*AS_FLAGS_SUS_PATH\b", text):
+            leak.append(rel)
+if leak:
+    print("::error::AS_FLAGS_SUS_PATH 的位操作出现在 fs/susfs.c 之外: %s —— 判定改表后这些点会失配，请把同样的改写移植过去" % ", ".join(leak[:10]))
+    raise SystemExit(1)
 PYEOF
   grep -n 'FINASU_SUS_PATH_ID_GUARD' fs/susfs.c | head
 else
@@ -915,15 +985,17 @@ fi
 # ==================== SUSFS sus_path_loop 条目身份校验 ====================
 # 背景：susfs_run_sus_path_loop() 每轮只用 kern_path() 取当前 dentry 就无条件
 # set_bit(AS_FLAGS_SUS_PATH)，既不校验对象是不是当初登记的那个，也不看位是否已置。
-# 上游原版只是“多打一次标志”，但本仓库的 SUS_PATH_ID_GUARD 会把循环里 set_bit 的对象
-# 一并登记成合法隐藏对象，于是打错一次就变成“一直误伤到重启”；同时重复置位会每轮刷日志
-# （实测 /sdcard/Android/data/github.tornaco.android.thanos 一个 boot 刷出 46 条）。
+# 上游原版只是“多打一次标志”；本仓库的 SUS_PATH_ID_GUARD（现行为私有身份表版本）会把
+# 循环里标记的对象一并登记成合法隐藏对象，于是打错一次就变成“一直误伤到重启”；同时
+# 上游的重复置位会每轮刷日志（实测 /sdcard/Android/data/github.tornaco.android.thanos
+# 一个 boot 刷出 46 条）。
 # 修复：为每个 LOOP 条目登记 (s_dev, ident)；FUSE 用 fi->nodeid（该类 inode 的 i_ino
-# 可能恒为 0），其余用 i_ino。只在标志位为空时补位并打印一次；连续
-# SUSFS_SUS_PATH_ID_MAX_MISMATCH 轮身份不一致即停止置位并摘链（不释放，结构体无 rcu_head）。
-# 位置要求：必须排在本文件的「SUSFS sus_path 误伤修复」块之后 —— 该块按 set_bit 行注入
-# susfs_sus_path_id_add()，本块整体重写循环函数，会把注入到循环里的那几行一并替换掉，
-# 改由新代码在“确认身份后”显式登记。
+# 可能恒为 0），其余用 i_ino。身份一致才把对象登记进身份表（登记幂等，替代原来的
+# set_bit）；连续 SUSFS_SUS_PATH_ID_MAX_MISMATCH 轮身份不一致即停止登记并摘链
+# （不释放，结构体无 rcu_head）。循环本身不再触碰 AS_FLAGS_SUS_PATH 位。
+# 位置要求：必须排在本文件的「SUSFS sus_path 误伤根治」块之后 —— 该块把 set_bit 行
+# 原地替换成 susfs_sus_path_id_add()，本块整体重写循环函数，会把替换后的那几行一并
+# 换掉，改由新代码在“确认身份后”显式登记。
 if [ -f fs/susfs.c ] && grep -qF 'FINASU_SUS_PATH_ID_GUARD' fs/susfs.c \
   && grep -qF 'static void susfs_run_sus_path_loop(void) {' fs/susfs.c \
   && ! grep -qF 'SUSFS_SUS_PATH_LOOP_ID_GUARD' fs/susfs.c; then
@@ -936,7 +1008,8 @@ P = "fs/susfs.c"
 
 MACHINERY = r"""/* SUSFS_SUS_PATH_LOOP_ID_GUARD: sus_path_loop 的条目身份登记表。
  * 每个 LH_SUS_PATH_LOOP 条目一份记录，只保存 (s_dev, ident) 与失配计数，
- * 不持有 inode 引用（避免 use-after-free），因此也不会去清除旧对象上的标志位。 */
+ * 不持有 inode 引用（避免 use-after-free）；登记/判定都走 SUS_PATH_ID_GUARD 的
+ * 身份表，不触碰 AS_FLAGS_SUS_PATH 位。 */
 #define SUSFS_SUS_PATH_ID_MAX_MISMATCH	3
 
 struct st_susfs_sus_path_loop_id {
@@ -987,8 +1060,9 @@ LOOP_FN = r"""/* SUSFS_SUS_PATH_LOOP_ID_GUARD: 原实现每轮只用 kern_path()
  *      变成一直持续到重启；
  *   2. 位已置时仍然每轮重复 set_bit 并打印，实测一个 boot 刷出几十条 re-flag 日志。
  * 这里为每个 LOOP 条目登记身份 (s_dev, ident)：FUSE 取 fi->nodeid（i_ino 可能恒为 0），
- * 其余取 i_ino；只在标志位为空时补位并打印一次；身份连续 SUSFS_SUS_PATH_ID_MAX_MISMATCH
- * 轮不一致即判定该路径已指向别的对象，停止置位并把条目从活动链表摘除（不释放）。
+ * 其余取 i_ino；身份一致才把对象登记进身份表（幂等，含分配失败自愈重试）；
+ * 身份连续 SUSFS_SUS_PATH_ID_MAX_MISMATCH 轮不一致即判定该路径已指向别的对象，
+ * 停止登记并把条目从活动链表摘除（不释放）。循环不再读写 AS_FLAGS_SUS_PATH 位。
  */
 static void susfs_run_sus_path_loop(void) {
 	struct st_susfs_sus_path_list *cursor = NULL;
@@ -1000,7 +1074,6 @@ static void susfs_run_sus_path_loop(void) {
 	dev_t s_dev;
 	u64 ident;
 	bool do_add;
-	bool do_flag;
 	const struct cred *saved = override_creds(ksu_cred);
 	int srcu_idx = srcu_read_lock(&susfs_srcu_sus_path_loop);
 
@@ -1027,7 +1100,6 @@ static void susfs_run_sus_path_loop(void) {
 		s_dev = inode->i_sb->s_dev;
 		ident = fi ? (u64)fi->nodeid : (u64)inode->i_ino;
 		do_add = false;
-		do_flag = false;
 
 		mutex_lock(&susfs_mutex_lock_sus_path);
 		id = susfs_sus_path_loop_id_of(cursor);
@@ -1057,17 +1129,19 @@ static void susfs_run_sus_path_loop(void) {
 					fi ? "nodeid" : "ino", ident);
 			} else if (!id->no_ident) {
 				id->no_ident = true;
-				SUSFS_LOGE("no stable identity for '%s', flag only when the bit is clear\n",
+				SUSFS_LOGE("no stable identity for '%s', skip this rule\n",
 					cursor->target_pathname);
 			}
 		}
 		if (id->tracked) {
 			if (id->s_dev == s_dev && id->ident == ident) {
 				id->mismatch = 0;
+				/* 登记幂等（表内查重即返回），每轮重登一次以便分配失败自愈 */
+				do_add = true;
 			} else {
 				id->mismatch++;
 				if (id->mismatch == 1)
-					SUSFS_LOGE("'%s' resolves to another object (s_dev: %u -> %u, ident: %llu -> %llu), skip flagging\n",
+					SUSFS_LOGE("'%s' resolves to another object (s_dev: %u -> %u, ident: %llu -> %llu), skip registering\n",
 						cursor->target_pathname, (unsigned int)id->s_dev,
 						(unsigned int)s_dev, id->ident, ident);
 				if (id->mismatch >= SUSFS_SUS_PATH_ID_MAX_MISMATCH) {
@@ -1077,18 +1151,10 @@ static void susfs_run_sus_path_loop(void) {
 				}
 			}
 		}
-		if (!id->stale && id->mismatch == 0)
-			do_flag = !test_bit(AS_FLAGS_SUS_PATH, &inode->i_mapping->flags);
 		mutex_unlock(&susfs_mutex_lock_sus_path);
 
 		if (do_add)
 			susfs_sus_path_id_add(inode);
-		if (do_flag) {
-			set_bit(AS_FLAGS_SUS_PATH, &inode->i_mapping->flags);
-			SUSFS_LOGI("re-flag AS_FLAGS_SUS_PATH on '%s', s_dev: %u, %s: %llu\n",
-				cursor->target_pathname, (unsigned int)s_dev,
-				fi ? "nodeid" : "ino", ident);
-		}
 		path_put(&path);
 	}
 	srcu_read_unlock(&susfs_srcu_sus_path_loop, srcu_idx);
@@ -1150,8 +1216,12 @@ out = out.replace(
 
 fn = out[out.find("static void susfs_run_sus_path_loop(void) {"):]
 fn = fn[:fn.find("static inline bool is_i_uid_not_allowed")]
-if fn.count("set_bit(AS_FLAGS_SUS_PATH") != 1 or fn.count("test_bit(AS_FLAGS_SUS_PATH") != 1:
-    print("::error::susfs_run_sus_path_loop 置位/判定点数量异常，已中止")
+# 循环改走身份表后，函数体内不允许再出现对 AS_FLAGS_SUS_PATH 的任何位操作
+if fn.count("set_bit(AS_FLAGS_SUS_PATH") != 0 or fn.count("test_bit(AS_FLAGS_SUS_PATH") != 0:
+    print("::error::susfs_run_sus_path_loop 仍含 AS_FLAGS_SUS_PATH 位操作，已中止")
+    raise SystemExit(1)
+if fn.count("susfs_sus_path_id_add(") < 1:
+    print("::error::susfs_run_sus_path_loop 缺少身份表登记调用，已中止")
     raise SystemExit(1)
 if fn.count("{") != fn.count("}") or fn.count("(") != fn.count(")"):
     print("::error::susfs_run_sus_path_loop 括号不配平，已中止")
