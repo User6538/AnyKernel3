@@ -1,18 +1,17 @@
 diff --git a/mm/swapfile.c b/mm/swapfile.c
 --- a/mm/swapfile.c
 +++ b/mm/swapfile.c
-@@ -3410,6 +3410,14 @@
+@@ -3410,6 +3410,13 @@
  	if (swap_flags & ~SWAP_FLAGS_VALID)
  		return -EINVAL;
-
+ 
 +	/*
 +	 * User6538/AnyKernel3: refuse all swap —— 关闭 swap（见 swap_patch/）
 +	 * 在 SYSCALL_DEFINE2(swapon) 入口处直接返回 -EINVAL，任何 swapon 请求
 +	 * （zram 与 swapfile）都不会成功，厂商 swapon_all 因此失效。
 +	 */
-+	pr_info("refuse all swap: swapon(%s) blocked\n", specialfile);
 +	return -EINVAL;
 +
  	if (!capable(CAP_SYS_ADMIN))
  		return -EPERM;
-
+ 
