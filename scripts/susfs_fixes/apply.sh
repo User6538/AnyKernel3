@@ -1245,6 +1245,343 @@ else
 fi
 
 
+# ==================== SUSFS sus_kstat / open_redirect / sus_map 共享位根治 ====================
+# 背景：AS_FLAGS_SUS_KSTAT (bit 35)、AS_FLAGS_OPEN_REDIRECT (bit 36)、
+# AS_FLAGS_SUS_MAP (bit 39) 在 inode->i_mapping->flags 中，与 AS_FLAGS_SUS_PATH
+# 存在完全相同的共享位污染问题：厂商内核可能占用同一位，inode 复用残留导致误判。
+# AS_FLAGS_SUS_MOUNT (bit 34) 虽有定义但在 susfs.c 中无任何 set_bit/test_bit 调用
+# （该特性走链表查找），不需要修。
+# 修复：与 sus_path 相同的模式——私有哈希表，每个特性一张。共享一套 key 提取基础设施
+# （FUSE 用 fi->nodeid，其余用 i_ino + i_generation）。所有 set_bit 原地替换为登记调用，
+# test_bit 原地替换为查表调用。susfs_def.h 中的 SUSFS_IS_INODE_SUS_MAP 和
+# SUSFS_IS_INODE_OPEN_REDIRECT 宏也改为调用查表函数（这些宏被 fs/proc/task_mmu.c
+# 等内核文件引用，改后头文件需声明函数原型）。
+if [ -f fs/susfs.c ] && grep -qF 'FINASU_SUS_PATH_ID_GUARD' fs/susfs.c \
+  && ! grep -qF 'FINASU_MULTI_ID_GUARD' fs/susfs.c; then
+  echo "为 sus_kstat / open_redirect / sus_map 加入私有身份表（与共享位彻底解耦）"
+  python3 - <<'PYEOF'
+import os, re, sys
+
+P = "fs/susfs.c"
+src = open(P, encoding="utf-8", errors="surrogateescape").read()
+
+if "FINASU_MULTI_ID_GUARD" in src:
+    print("fs/susfs.c already has multi-id guard, skipping")
+    raise SystemExit(0)
+
+GUARD = '''
+/* FINASU_MULTI_ID_GUARD: sus_kstat, open_redirect, sus_map identity tables.
+ * These features used AS_FLAGS_SUS_KSTAT (bit 35), AS_FLAGS_OPEN_REDIRECT
+ * (bit 36), AS_FLAGS_SUS_MAP (bit 39) in inode i_mapping flags. Same
+ * shared-bit pollution as AS_FLAGS_SUS_PATH: vendor kernels may occupy the
+ * same bits, inode reuse leaves stale bits, causing false positives. Here
+ * we decouple all three from shared bits into private hash tables. Key
+ * extraction is identical to sus_path: FUSE uses fi nodeid, others use
+ * i_ino plus i_generation. */
+#define SUSFS_ID_HASH_BITS 10
+
+struct st_susfs_id_key {
+	struct hlist_node node;
+	dev_t s_dev;
+	u64 ident;
+	u32 i_generation;
+	bool is_fuse;
+};
+
+static u64 susfs_id_key_ident(struct inode *inode, u32 *i_generation, bool *is_fuse)
+{
+	struct fuse_inode *fi;
+
+	*i_generation = 0;
+	*is_fuse = false;
+	if (inode->i_sb->s_magic == FUSE_SUPER_MAGIC) {
+		fi = get_fuse_inode(inode);
+		if (fi && fi->nodeid) {
+			*is_fuse = true;
+			return (u64)fi->nodeid;
+		}
+	}
+	*i_generation = (u32)inode->i_generation;
+	return (u64)inode->i_ino;
+}
+
+static void susfs_id_add_generic(struct inode *inode,
+				 struct hlist_head *table,
+				 atomic_t *count, spinlock_t *lock)
+{
+	struct st_susfs_id_key *key, *tmp_key;
+	struct hlist_node *tmp_node;
+	unsigned long irq_flags;
+	u32 i_generation;
+	bool is_fuse;
+	u64 ident;
+
+	if (!inode || !inode->i_sb)
+		return;
+
+	ident = susfs_id_key_ident(inode, &i_generation, &is_fuse);
+	if (!ident) {
+		SUSFS_LOGE("no stable identity, skip registering\\n");
+		return;
+	}
+
+	spin_lock_irqsave(lock, irq_flags);
+	hlist_for_each_entry_safe(tmp_key, tmp_node,
+				  &table[hash_64(ident, SUSFS_ID_HASH_BITS)], node) {
+		if (tmp_key->ident == ident && tmp_key->s_dev == inode->i_sb->s_dev
+		    && tmp_key->is_fuse == is_fuse
+		    && (is_fuse || tmp_key->i_generation == i_generation)) {
+			spin_unlock_irqrestore(lock, irq_flags);
+			return;
+		}
+	}
+	key = kzalloc(sizeof(*key), GFP_ATOMIC);
+	if (!key) {
+		spin_unlock_irqrestore(lock, irq_flags);
+		SUSFS_LOGE("id key alloc failed\\n");
+		return;
+	}
+	key->s_dev = inode->i_sb->s_dev;
+	key->ident = ident;
+	key->i_generation = i_generation;
+	key->is_fuse = is_fuse;
+	hlist_add_head_rcu(&key->node, &table[hash_64(ident, SUSFS_ID_HASH_BITS)]);
+	atomic_inc(count);
+	spin_unlock_irqrestore(lock, irq_flags);
+}
+
+static bool susfs_id_match_generic(struct inode *inode,
+				   struct hlist_head *table,
+				   atomic_t *count)
+{
+	struct st_susfs_id_key *key;
+	u32 i_generation;
+	bool is_fuse;
+	u64 ident;
+	bool found = false;
+
+	if (!inode || !inode->i_sb)
+		return false;
+
+	if (!atomic_read(count))
+		return false;
+
+	ident = susfs_id_key_ident(inode, &i_generation, &is_fuse);
+	if (!ident)
+		return false;
+
+	rcu_read_lock();
+	hlist_for_each_entry_rcu(key,
+				 &table[hash_64(ident, SUSFS_ID_HASH_BITS)], node) {
+		if (key->ident == ident && key->s_dev == inode->i_sb->s_dev
+		    && key->is_fuse == is_fuse
+		    && (is_fuse || key->i_generation == i_generation)) {
+			found = true;
+			break;
+		}
+	}
+	rcu_read_unlock();
+	return found;
+}
+
+static atomic_t susfs_sus_kstat_key_count = ATOMIC_INIT(0);
+static DEFINE_SPINLOCK(susfs_spin_lock_sus_kstat_key);
+static DEFINE_HASHTABLE(SUS_KSTAT_KEY_HLIST, SUSFS_ID_HASH_BITS);
+
+static void susfs_sus_kstat_id_add(struct inode *inode)
+{
+	susfs_id_add_generic(inode, SUS_KSTAT_KEY_HLIST,
+			     &susfs_sus_kstat_key_count,
+			     &susfs_spin_lock_sus_kstat_key);
+}
+
+static bool susfs_sus_kstat_id_match(struct inode *inode)
+{
+	return susfs_id_match_generic(inode, SUS_KSTAT_KEY_HLIST,
+				      &susfs_sus_kstat_key_count);
+}
+
+static atomic_t susfs_open_redirect_key_count = ATOMIC_INIT(0);
+static DEFINE_SPINLOCK(susfs_spin_lock_open_redirect_key);
+static DEFINE_HASHTABLE(OPEN_REDIRECT_KEY_HLIST, SUSFS_ID_HASH_BITS);
+
+static void susfs_open_redirect_id_add(struct inode *inode)
+{
+	susfs_id_add_generic(inode, OPEN_REDIRECT_KEY_HLIST,
+			     &susfs_open_redirect_key_count,
+			     &susfs_spin_lock_open_redirect_key);
+}
+
+bool susfs_open_redirect_id_match(struct inode *inode)
+{
+	return susfs_id_match_generic(inode, OPEN_REDIRECT_KEY_HLIST,
+				     &susfs_open_redirect_key_count);
+}
+
+static atomic_t susfs_sus_map_key_count = ATOMIC_INIT(0);
+static DEFINE_SPINLOCK(susfs_spin_lock_sus_map_key);
+static DEFINE_HASHTABLE(SUS_MAP_KEY_HLIST, SUSFS_ID_HASH_BITS);
+
+static void susfs_sus_map_id_add(struct inode *inode)
+{
+	susfs_id_add_generic(inode, SUS_MAP_KEY_HLIST,
+			     &susfs_sus_map_key_count,
+			     &susfs_spin_lock_sus_map_key);
+}
+
+bool susfs_sus_map_id_match(struct inode *inode)
+{
+	return susfs_id_match_generic(inode, SUS_MAP_KEY_HLIST,
+				     &susfs_sus_map_key_count);
+}
+'''
+
+# 自检：注释块内不允许嵌套 /* 或 */（内核 -Werror,-Wcomment 会直接报错）
+if GUARD.count("/*") != 1 or GUARD.count("*/") != 1:
+    print("::error::GUARD 注释块内含嵌套的 /* 或 */，请修正脚本内注释文字")
+    raise SystemExit(1)
+
+# 括号配平校验（防止机械生成引入语法错误）
+if GUARD.count("{") != GUARD.count("}") or GUARD.count("(") != GUARD.count(")"):
+    print("::error::GUARD 括号不配平")
+    raise SystemExit(1)
+
+# 插入身份表代码（锚点与 sus_path 相同：susfs_fake_qstr_name）
+anchor_idx = src.find("susfs_fake_qstr_name")
+if anchor_idx < 0:
+    print("::error::fs/susfs.c: 未找到锚点 susfs_fake_qstr_name")
+    raise SystemExit(1)
+anchor_end = src.find("\n", anchor_idx)
+new = src[:anchor_end + 1] + GUARD + src[anchor_end + 1:]
+
+# ---- 替换 SUS_KSTAT 位操作 ----
+new, n1 = re.subn(r"\bset_bit\(AS_FLAGS_SUS_KSTAT,\s*&fi->inode\.i_mapping->flags\);",
+                  "susfs_sus_kstat_id_add(&fi->inode);", new)
+new, n2 = re.subn(r"\bset_bit\(AS_FLAGS_SUS_KSTAT,\s*&inode->i_mapping->flags\);",
+                  "susfs_sus_kstat_id_add(inode);", new)
+new, n3 = re.subn(r"\btest_bit\(AS_FLAGS_SUS_KSTAT,\s*&fi->inode\.i_mapping->flags\)",
+                  "susfs_sus_kstat_id_match(&fi->inode)", new)
+new, n4 = re.subn(r"\btest_bit\(AS_FLAGS_SUS_KSTAT,\s*&inode->i_mapping->flags\)",
+                  "susfs_sus_kstat_id_match(inode)", new)
+
+# ---- 替换 OPEN_REDIRECT 位操作 ----
+new, n5 = re.subn(r"\bset_bit\(AS_FLAGS_OPEN_REDIRECT,\s*&redirected_inode->i_mapping->flags\);",
+                  "susfs_open_redirect_id_add(redirected_inode);", new)
+new, n6 = re.subn(r"\bset_bit\(AS_FLAGS_OPEN_REDIRECT,\s*&target_inode->i_mapping->flags\);",
+                  "susfs_open_redirect_id_add(target_inode);", new)
+
+# ---- 替换 SUS_MAP 位操作 ----
+new, n7 = re.subn(r"\bset_bit\(AS_FLAGS_SUS_MAP,\s*&inode->i_mapping->flags\);",
+                  "susfs_sus_map_id_add(inode);", new)
+
+total = n1 + n2 + n3 + n4 + n5 + n6 + n7
+if total < 7:
+    print("::error::fs/susfs.c: 位操作替换数量不足 (expected>=7, got=%d)" % total)
+    print("  sus_kstat: set_fi=%d set_self=%d tst_fi=%d tst_self=%d" % (n1, n2, n3, n4))
+    print("  open_redirect: redirected=%d target=%d" % (n5, n6))
+    print("  sus_map: set=%d" % n7)
+    raise SystemExit(1)
+
+# 不允许残留任何对这三个位的位操作
+for flag in ("AS_FLAGS_SUS_KSTAT", "AS_FLAGS_OPEN_REDIRECT", "AS_FLAGS_SUS_MAP"):
+    leftover = re.search(r"\b[a-zA-Z_]+_bit\(\s*" + flag + r"\b", new)
+    if leftover:
+        print("::error::fs/susfs.c: 仍存在未改写的位操作: %s (%s)" % (leftover.group(0), flag))
+        raise SystemExit(1)
+
+open(P, "w", encoding="utf-8", errors="surrogateescape").write(new)
+print("fs/susfs.c: sus_kstat/open_redirect/sus_map 位操作已替换 (total=%d)" % total)
+
+# ---------- 修改 include/linux/susfs_def.h：宏改为调用查表函数 ----------
+DP = "include/linux/susfs_def.h"
+if not os.path.isfile(DP):
+    print("::warning::%s not found, skipping macro changes" % DP)
+else:
+    dsrc = open(DP, encoding="utf-8", errors="surrogateescape").read()
+
+    if "susfs_sus_map_id_match" in dsrc:
+        print("susfs_def.h already modified, skipping")
+    else:
+        # 在宏定义之前插入函数原型声明
+        DECL = ("bool susfs_sus_map_id_match(struct inode *inode);\n"
+                "bool susfs_open_redirect_id_match(struct inode *inode);\n\n")
+        macro_idx = dsrc.find("#define SUSFS_IS_INODE_SUS_MAP")
+        if macro_idx < 0:
+            print("::warning::susfs_def.h: SUSFS_IS_INODE_SUS_MAP 宏未找到，跳过头文件修改")
+        else:
+            dsrc = dsrc[:macro_idx] + DECL + dsrc[macro_idx:]
+
+        # 把宏中的 test_bit 替换为查表函数调用
+        dsrc = dsrc.replace(
+            "unlikely(test_bit(AS_FLAGS_SUS_MAP, &inode->i_mapping->flags))",
+            "unlikely(susfs_sus_map_id_match(inode))")
+        dsrc = dsrc.replace(
+            "unlikely(test_bit(AS_FLAGS_OPEN_REDIRECT, &inode->i_mapping->flags))",
+            "unlikely(susfs_open_redirect_id_match(inode))")
+        # 兜底：不带 unlikely() 的形态
+        dsrc = dsrc.replace(
+            "test_bit(AS_FLAGS_SUS_MAP, &inode->i_mapping->flags)",
+            "susfs_sus_map_id_match(inode)")
+        dsrc = dsrc.replace(
+            "test_bit(AS_FLAGS_OPEN_REDIRECT, &inode->i_mapping->flags)",
+            "susfs_open_redirect_id_match(inode)")
+
+        # 同时去掉宏中多余的 inode && i_mapping && 检查（查表函数内部已做 NULL 安全）
+        dsrc = dsrc.replace(
+            "inode && inode->i_mapping &&\n\t\tunlikely(susfs_sus_map_id_match(inode))",
+            "unlikely(susfs_sus_map_id_match(inode))")
+        dsrc = dsrc.replace(
+            "inode && inode->i_mapping &&\n\t\tunlikely(susfs_open_redirect_id_match(inode))",
+            "unlikely(susfs_open_redirect_id_match(inode))")
+
+        # 断言头文件中不再残留这三个位的 test_bit
+        for flag in ("AS_FLAGS_SUS_MAP", "AS_FLAGS_OPEN_REDIRECT", "AS_FLAGS_SUS_KSTAT"):
+            if re.search(r"\b[a-zA-Z_]+_bit\(\s*" + flag + r"\b", dsrc):
+                print("::error::susfs_def.h: 仍残留 %s 的位操作" % flag)
+                raise SystemExit(1)
+
+        open(DP, "w", encoding="utf-8", errors="surrogateescape").write(dsrc)
+        print("include/linux/susfs_def.h: 宏已改为调用查表函数")
+
+# ---------- 全树扫描：确认这三个位的位操作只存在于已处理文件中 ----------
+leak = []
+for root, dirs, files in os.walk("."):
+    dirs[:] = [d for d in dirs if d not in (".git", ".tmp_versions")]
+    for fn in files:
+        if not fn.endswith((".c", ".h")):
+            continue
+        path = os.path.join(root, fn)
+        rel = os.path.relpath(path, ".").replace(os.sep, "/")
+        if rel in ("fs/susfs.c", "include/linux/susfs_def.h"):
+            continue
+        try:
+            if os.path.getsize(path) > 6 * 1024 * 1024:
+                continue
+            text = open(path, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        for flag in ("AS_FLAGS_SUS_KSTAT", "AS_FLAGS_OPEN_REDIRECT", "AS_FLAGS_SUS_MAP"):
+            if re.search(r"\b[a-zA-Z_]+_bit\(\s*" + flag + r"\b", text):
+                leak.append("%s (%s)" % (rel, flag))
+if leak:
+    print("::error::这三个位的位操作出现在已处理文件之外: %s" % ", ".join(leak[:10]))
+    raise SystemExit(1)
+print("全树扫描通过：sus_kstat/open_redirect/sus_map 的位操作已全部替换")
+PYEOF
+  grep -n 'FINASU_MULTI_ID_GUARD' fs/susfs.c | head
+else
+  if [ -f fs/susfs.c ] && ! grep -qF 'FINASU_MULTI_ID_GUARD' fs/susfs.c; then
+    if ! grep -qF 'FINASU_SUS_PATH_ID_GUARD' fs/susfs.c; then
+      echo "::warning title=multi-id 未修复::未找到 sus_path 身份校验块（FINASU_SUS_PATH_ID_GUARD），multi-id 修复依赖 sus_path 块先行应用"
+    else
+      echo "跳过 multi-id 修复（已应用或条件不匹配）"
+    fi
+  else
+    echo "跳过 multi-id 修复（已应用）"
+  fi
+fi
+
+
 # ---- 预期冲突处理：上游已包含同款修改的 .rej 剔除，真实缺失的手工补齐 ----
 
 # 1) fs/unicode：ASB 内核已包含上游 "unicode: don't special case ignorable code
