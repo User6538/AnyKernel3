@@ -65,6 +65,11 @@ on:
         default: ""
 
       # ==================== 功能开关 ====================
+      remove_swap:
+        description: "关闭 swap（内核侧拒绝所有 swapon）"
+        required: false
+        type: boolean
+        default: true
       use_zram:
         required: true
         type: boolean
@@ -142,6 +147,7 @@ jobs:
           echo "构建通道      : ${{ inputs.build_channel }}"
           echo "构建时间      : ${{ inputs.build_time }}"
           echo "SUSFS 状态    : ${{ inputs.enable_susfs }}"
+          echo "关闭 swap     : ${{ inputs.remove_swap }}"
           echo "ZRAM 压缩     : ${{ inputs.use_zram }}"
           echo "BBG 补丁      : ${{ inputs.use_bbg }}"
           echo "网络增强      : ${{ inputs.use_net_enhance }}"
@@ -1253,6 +1259,7 @@ jobs:
           fi
 
       - name: 关闭 swap（内核侧拒绝所有 swapon）
+        if: inputs.remove_swap
         working-directory: ${{ env.KERNEL_ROOT }}/common
         run: |
           # 在 SYSCALL_DEFINE2(swapon) 入口直接返回 -EINVAL：任何 swapon 都会失败，
@@ -1293,6 +1300,53 @@ jobs:
             swap_fail "补丁应用后校验失败"
           fi
           echo "swapon 已改为直接返回 -EINVAL，swap 不会再被启用"
+      - name: 校验 slab 分配 node（规避厂商模块越界重启）
+        working-directory: ${{ env.KERNEL_ROOT }}/common
+        run: |
+          # 厂商树外 zcache 模块的 prio_store 会把越界 node 值传给
+          # alloc_io_context -> kmem_cache_alloc_node -> __slab_alloc，
+          # 越界索引 s->node[node] 触发 UBSAN array index out of bounds；
+          # CONFIG_UBSAN_TRAP=y 时直接整机 panic 重启。
+          # zcache 模块标记为 permanent 无法卸载，且为闭源无法修复；
+          # 这里在 slab 慢路径入口把非法 node 收敛为 NUMA_NO_NODE，
+          # 覆盖 sysfs / ioctl 等所有入口，合法调用方行为不变。
+          # CONFIG_UBSAN_TRAP 保持开启：若厂商模块还有别的越界，继续当场上报。
+          node_fail() {
+            if [ "$SKIP_INCOMPATIBLE" = "true" ]; then
+              echo "::warning title=slab node 校验已跳过::$1"
+              if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+                echo "" >> "$GITHUB_STEP_SUMMARY"
+                echo "> ⏭️ **slab node 校验** 已自动跳过：$1（构建未中断）" >> "$GITHUB_STEP_SUMMARY"
+              fi
+              exit 0
+            fi
+            echo "::error::$1"
+            exit 1
+          }
+
+          NODE_PATCH="$ZZH_PATCHES/prio_patch/slab_node_guard.patch"
+          if [ ! -f "$NODE_PATCH" ]; then
+            node_fail "未找到补丁文件 prio_patch/slab_node_guard.patch"
+          fi
+
+          # 幂等：已含改动则跳过
+          if grep -q "ZCACHE_NODE_GUARD" mm/slub.c; then
+            echo "mm/slub.c 已含 node 校验改动，跳过"
+            exit 0
+          fi
+
+          if git apply --check -p1 "$NODE_PATCH" >/dev/null 2>&1; then
+            git apply -p1 "$NODE_PATCH"
+          elif patch -p1 --forward --batch < "$NODE_PATCH" >/dev/null 2>&1; then
+            echo "已通过 patch 应用"
+          else
+            node_fail "mm/slub.c 补丁未应用（内核版本不匹配）"
+          fi
+
+          if ! grep -q "ZCACHE_NODE_GUARD" mm/slub.c; then
+            node_fail "补丁应用后校验失败"
+          fi
+          echo "已在 slab 慢路径入口校验 node（非法值收敛为 NUMA_NO_NODE）"
       - name: 添加 BBG 基带保护补丁
         if: inputs.use_bbg
         working-directory: ${{ env.KERNEL_ROOT }}
@@ -1605,20 +1659,20 @@ jobs:
 
           sed -i 's/check_defconfig//' ./common/build.config.gki
 
-      - name: 添加 SUSFS 配置
+      - name: 添加 SUSFS 配置（验证：保留框架，禁用全部子功能，定位春秋崩溃根因）
         if: inputs.enable_susfs
         run: |
           cat >> "$DEFCONFIG" << 'EOF'
           CONFIG_KSU_SUSFS=y
-          CONFIG_KSU_SUSFS_SUS_PATH=y
-          CONFIG_KSU_SUSFS_SUS_MOUNT=y
-          CONFIG_KSU_SUSFS_SUS_KSTAT=y
-          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
-          CONFIG_KSU_SUSFS_ENABLE_LOG=y
-          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
-          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
-          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
-          CONFIG_KSU_SUSFS_SUS_MAP=y
+          # CONFIG_KSU_SUSFS_SUS_PATH is not set
+          # CONFIG_KSU_SUSFS_SUS_MOUNT is not set
+          # CONFIG_KSU_SUSFS_SUS_KSTAT is not set
+          # CONFIG_KSU_SUSFS_SPOOF_UNAME is not set
+          # CONFIG_KSU_SUSFS_ENABLE_LOG is not set
+          # CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS is not set
+          # CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG is not set
+          # CONFIG_KSU_SUSFS_OPEN_REDIRECT is not set
+          # CONFIG_KSU_SUSFS_SUS_MAP is not set
           EOF
 
       - name: 配置内核名称
