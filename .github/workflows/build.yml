@@ -69,6 +69,11 @@ on:
         required: true
         type: boolean
         default: true
+      cancel_swap:
+        description: "关闭 swap（内核侧拒绝所有 swapon，厂商 swapon_all 失效）"
+        required: false
+        type: boolean
+        default: true
       use_bbg:
         required: true
         type: boolean
@@ -143,6 +148,7 @@ jobs:
           echo "构建时间      : ${{ inputs.build_time }}"
           echo "SUSFS 状态    : ${{ inputs.enable_susfs }}"
           echo "ZRAM 压缩     : ${{ inputs.use_zram }}"
+          echo "关闭 swap     : ${{ inputs.cancel_swap }}"
           echo "BBG 补丁      : ${{ inputs.use_bbg }}"
           echo "网络增强      : ${{ inputs.use_net_enhance }}"
           echo "KPM 功能      : ${{ inputs.use_kpm }}"
@@ -1253,6 +1259,7 @@ jobs:
           fi
 
       - name: 关闭 swap（内核侧拒绝所有 swapon）
+        if: inputs.cancel_swap
         working-directory: ${{ env.KERNEL_ROOT }}/common
         run: |
           # 在 SYSCALL_DEFINE2(swapon) 入口直接返回 -EINVAL：任何 swapon 都会失败，

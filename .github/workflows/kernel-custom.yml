@@ -260,6 +260,11 @@ on:
         required: true
         type: boolean
         default: false
+      cancel_swap:
+        description: "关闭 swap（内核侧拒绝所有 swapon，厂商 swapon_all 失效）"
+        required: false
+        type: boolean
+        default: true
       use_bbg:
         description: "启用 BBG 基带保护"
         required: true
@@ -422,6 +427,7 @@ jobs:
       version: ${{ inputs.version || '' }}
       build_time: ${{ inputs.build_time || '' }}
       use_zram: ${{ inputs.use_zram }}
+      cancel_swap: ${{ inputs.cancel_swap }}
       use_bbg: ${{ inputs.use_bbg }}
       use_net_enhance: ${{ inputs.use_net_enhance }}
       use_kpm: ${{ inputs.use_kpm }}
