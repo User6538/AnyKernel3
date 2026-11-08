@@ -117,6 +117,10 @@ on:
         description: "禁用 SUSFS"
         type: boolean
         default: false
+      remove_swap:
+        description: "关闭 swap（内核侧拒绝所有 swapon）"
+        type: boolean
+        default: true
 
       # ==================== 兼容性 ====================
       skip_incompatible:
@@ -182,6 +186,7 @@ jobs:
       use_rekernel: ${{ inputs.use_rekernel }}
       cve_2026_43499_patch: ${{ inputs.cve_2026_43499_patch }}
       cancel_susfs: ${{ inputs.cancel_susfs }}
+      remove_swap: ${{ inputs.remove_swap }}
       droidspaces: ${{ inputs.droidspaces }}
       artifact_upload_mode: ${{ inputs.artifact_upload_mode }}
       droidspaces_ntsync: ${{ inputs.droidspaces_ntsync }}
@@ -210,6 +215,7 @@ jobs:
       use_rekernel: ${{ inputs.use_rekernel }}
       cve_2026_43499_patch: ${{ inputs.cve_2026_43499_patch }}
       cancel_susfs: ${{ inputs.cancel_susfs }}
+      remove_swap: ${{ inputs.remove_swap }}
       droidspaces: ${{ inputs.droidspaces }}
       artifact_upload_mode: ${{ inputs.artifact_upload_mode }}
       droidspaces_ntsync: ${{ inputs.droidspaces_ntsync }}
@@ -238,6 +244,7 @@ jobs:
       use_rekernel: ${{ inputs.use_rekernel }}
       cve_2026_43499_patch: ${{ inputs.cve_2026_43499_patch }}
       cancel_susfs: ${{ inputs.cancel_susfs }}
+      remove_swap: ${{ inputs.remove_swap }}
       droidspaces: ${{ inputs.droidspaces }}
       artifact_upload_mode: ${{ inputs.artifact_upload_mode }}
       droidspaces_ntsync: ${{ inputs.droidspaces_ntsync }}
@@ -266,6 +273,7 @@ jobs:
       use_rekernel: ${{ inputs.use_rekernel }}
       cve_2026_43499_patch: ${{ inputs.cve_2026_43499_patch }}
       cancel_susfs: ${{ inputs.cancel_susfs }}
+      remove_swap: ${{ inputs.remove_swap }}
       droidspaces: ${{ inputs.droidspaces }}
       artifact_upload_mode: ${{ inputs.artifact_upload_mode }}
       droidspaces_ntsync: ${{ inputs.droidspaces_ntsync }}
@@ -294,6 +302,7 @@ jobs:
       use_rekernel: ${{ inputs.use_rekernel }}
       cve_2026_43499_patch: ${{ inputs.cve_2026_43499_patch }}
       cancel_susfs: ${{ inputs.cancel_susfs }}
+      remove_swap: ${{ inputs.remove_swap }}
       droidspaces: ${{ inputs.droidspaces }}
       artifact_upload_mode: ${{ inputs.artifact_upload_mode }}
       droidspaces_ntsync: ${{ inputs.droidspaces_ntsync }}
