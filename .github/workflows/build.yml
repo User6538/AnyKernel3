@@ -1248,13 +1248,18 @@ jobs:
           fi
 
           if grep -q "CONFIG_ZSMALLOC=y" "$CONFIG_FILE" && grep -q "CONFIG_ZRAM=y" "$CONFIG_FILE"; then
-            # ZRAM_BACKEND_* 仅在 6.12+ 的 Kconfig 中声明；bazel 构建的 kernel_config
-            # 会校验 fragment 中每个配置项都必须存在于 Kconfig，旧版本内核带上
-            # 这些行会直接导致编译失败，因此 6.12 以下需剔除
-            if [ "$(printf '%s\n' "6.12" "${{ inputs.kernel_version }}" | sort -V | head -1)" = "6.12" ]; then
-              cat "$ZZH_PATCHES/config/zram.config" >> "$CONFIG_FILE"
+            ZRAM_CONFIG="$ZZH_PATCHES/config/zram.config"
+            if [ -f "$ZRAM_CONFIG" ]; then
+              # ZRAM_BACKEND_* 仅在 6.12+ 的 Kconfig 中声明；bazel 构建的 kernel_config
+              # 会校验 fragment 中每个配置项都必须存在于 Kconfig，旧版本内核带上
+              # 这些行会直接导致编译失败，因此 6.12 以下需剔除
+              if [ "$(printf '%s\n' "6.12" "${{ inputs.kernel_version }}" | sort -V | head -1)" = "6.12" ]; then
+                cat "$ZRAM_CONFIG" >> "$CONFIG_FILE"
+              else
+                grep -v '^CONFIG_ZRAM_BACKEND_' "$ZRAM_CONFIG" >> "$CONFIG_FILE"
+              fi
             else
-              grep -v '^CONFIG_ZRAM_BACKEND_' "$ZZH_PATCHES/config/zram.config" >> "$CONFIG_FILE"
+              echo "::warning::未找到 config/zram.config，ZRAM 后端配置项未写入"
             fi
           fi
 
@@ -1277,27 +1282,39 @@ jobs:
             exit 1
           }
 
-          SWAP_PATCH="$ZZH_PATCHES/swap_patch/refuse_all_swap.patch"
-          if [ ! -f "$SWAP_PATCH" ]; then
-            swap_fail "未找到补丁文件 swap_patch/refuse_all_swap.patch"
-          fi
-
           # 幂等：已含改动则跳过
           if grep -q "refuse all swap" mm/swapfile.c; then
             echo "mm/swapfile.c 已含关闭 swap 改动，跳过"
             exit 0
           fi
 
-          if git apply --check -p1 "$SWAP_PATCH" >/dev/null 2>&1; then
-            git apply -p1 "$SWAP_PATCH"
-          elif patch -p1 --forward --batch < "$SWAP_PATCH" >/dev/null 2>&1; then
-            echo "已通过 patch 应用"
-          else
-            swap_fail "mm/swapfile.c 补丁未应用（内核版本不匹配）"
+          # 方法1（主）：patch 文件（存在时优先用，fuzz=3 容忍上下文偏差）
+          SWAP_PATCH="$ZZH_PATCHES/swap_patch/refuse_all_swap.patch"
+          if [ -f "$SWAP_PATCH" ]; then
+            git apply -p1 "$SWAP_PATCH" 2>/dev/null || \
+            patch -p1 --forward --batch --fuzz=3 < "$SWAP_PATCH" 2>/dev/null || true
+          fi
+
+          # 方法2（备）：awk 精确插入（patch 文件不存在或未命中时）
+          # 锚点：swap_flags & ~SWAP_FLAGS_VALID → 紧跟的 return -EINVAL（swapon 入口固定结构）
+          if ! grep -q "refuse all swap" mm/swapfile.c; then
+            awk '
+            /swap_flags.*SWAP_FLAGS_VALID/ { saw_swap_flags = 1 }
+            saw_swap_flags && /return -EINVAL/ {
+              print
+              print ""
+              print "\t/* refuse all swap: swapon blocked */"
+              print "\tpr_info(\"refuse all swap: swapon(%s) blocked\\n\", specialfile);"
+              print "\treturn -EINVAL;"
+              saw_swap_flags = 0
+              next
+            }
+            { print }
+            ' mm/swapfile.c > mm/swapfile.c.tmp && mv mm/swapfile.c.tmp mm/swapfile.c
           fi
 
           if ! grep -q "refuse all swap" mm/swapfile.c; then
-            swap_fail "补丁应用后校验失败"
+            swap_fail "mm/swapfile.c 补丁未应用（找不到 SWAP_FLAGS_VALID 锚点）"
           fi
           echo "swapon 已改为直接返回 -EINVAL，swap 不会再被启用"
       - name: 校验 slab 分配 node（规避厂商模块越界重启）
@@ -1371,40 +1388,60 @@ jobs:
           # module_layout() 是空函数，CRC 仅是布局指示器，非真实接口契约；
           # 这里让 check_modstruct_version() 对 module_layout 始终放行，
           # 其他符号的版本检查不受影响。
-          modver_fail() {
-            if [ "$SKIP_INCOMPATIBLE" = "true" ]; then
-              echo "::warning title=module_layout 补丁已跳过::$1"
-              if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-                echo "" >> "$GITHUB_STEP_SUMMARY"
-                echo "> ⏭️ **module_layout 容忍** 已自动跳过：$1（构建未中断）" >> "$GITHUB_STEP_SUMMARY"
-              fi
-              exit 0
+          #
+          # 注意：这是可选安全网。若当前内核 module_layout CRC 已匹配（厂商模块
+          # 能正常加载），此改动为 no-op，不影响任何行为。找不到锚点时降级为
+          # warning（不中断构建），因为不是必需功能。
+
+          modver_skip() {
+            echo "::warning title=module_layout 补丁已跳过::$1"
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+              echo "> ⏭️ **module_layout 容忍** 已跳过：$1（构建未中断）" >> "$GITHUB_STEP_SUMMARY"
             fi
-            echo "::error::$1"
-            exit 1
+            exit 0
           }
 
-          MODVER_PATCH="$ZZH_PATCHES/modver_patch/tolerate_module_layout_mismatch.patch"
-          if [ ! -f "$MODVER_PATCH" ]; then
-            modver_fail "未找到补丁文件 modver_patch/tolerate_module_layout_mismatch.patch"
+          # 1. CONFIG_MODVERSIONS 未开启 → 根本没有版本检查，不需要此补丁
+          if ! grep -q "CONFIG_MODVERSIONS=y" .config 2>/dev/null; then
+            modver_skip "CONFIG_MODVERSIONS 未开启，无需 module_layout 容忍"
           fi
 
-          # 幂等：已含改动则跳过
-          if grep -q "Tolerate module_layout CRC mismatch" kernel/module/version.c; then
-            echo "kernel/module/version.c 已含 module_layout 容忍改动，跳过"
+          # 2. 检测目标文件：6.4+ 用 kernel/module/version.c，旧版（5.10/5.15/6.1）用 kernel/module.c
+          MODVER_FILE=""
+          for f in kernel/module/version.c kernel/module.c; do
+            if [ -f "$f" ]; then
+              MODVER_FILE="$f"
+              break
+            fi
+          done
+          if [ -z "$MODVER_FILE" ]; then
+            modver_skip "未找到 kernel/module/version.c 或 kernel/module.c（内核可能未编译模块支持）"
+          fi
+
+          # 3. 幂等：已含改动则跳过
+          if grep -q "Tolerate module_layout CRC mismatch" "$MODVER_FILE"; then
+            echo "$MODVER_FILE 已含 module_layout 容忍改动，跳过"
             exit 0
           fi
 
-          if git apply --check -p1 "$MODVER_PATCH" >/dev/null 2>&1; then
-            git apply -p1 "$MODVER_PATCH"
-          elif patch -p1 --forward --batch < "$MODVER_PATCH" >/dev/null 2>&1; then
-            echo "已通过 patch 应用"
-          else
-            modver_fail "kernel/module/version.c 补丁未应用（内核版本不匹配）"
-          fi
+          # 4. awk 替换 return check_version 行（纯源码操作，不依赖任何外部补丁文件）
+          #    匹配 return check_version(info, "module_layout" —— 不依赖变量名（crc / fsa.crc）
+          awk '
+          /return check_version\(info, "module_layout"/ {
+            print "\t/* Tolerate module_layout CRC mismatch: custom kernel struct module layout */"
+            sub(/return /, "(void) ")
+            print
+            print "\treturn 1;"
+            next
+          }
+          { print }
+          ' "$MODVER_FILE" > "$MODVER_FILE.tmp" && mv "$MODVER_FILE.tmp" "$MODVER_FILE"
 
-          if ! grep -q "Tolerate module_layout CRC mismatch" kernel/module/version.c; then
-            modver_fail "补丁应用后校验失败"
+          # 5. 校验：awk 未命中说明该内核可能没有 check_modstruct_version（非标准配置）
+          #    降级为 warning，不中断构建
+          if ! grep -q "Tolerate module_layout CRC mismatch" "$MODVER_FILE"; then
+            modver_skip "$MODVER_FILE 中未找到 check_version/module_layout 锚点（可能该内核不需要此补丁）"
           fi
           echo "module_layout 版本检查已容忍（厂商模块可正常加载）"
       - name: 添加 BBG 基带保护补丁
