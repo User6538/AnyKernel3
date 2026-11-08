@@ -1,0 +1,23 @@
+diff --git a/mm/slub.c b/mm/slub.c
+index b813dea..f7a72bf 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -3333,6 +3333,18 @@ static void *__slab_alloc(struct kmem_cache *s, gfp_t gfpflags, int node,
+ {
+ 	void *p;
+
++	/*
++	 * ZCACHE_NODE_GUARD: 厂商树外 zcache 模块在启动早期会把未初始化/越界的 node 值
++	 * 沿 prio_store -> alloc_io_context 传进 slab 慢路径；该值随后被
++	 * get_partial() -> get_node() 用来索引定长数组 s->node[node]
++	 * （struct kmem_cache 内的 node[MAX_NUMNODES]），触发 UBSAN
++	 * array index out of bounds；CONFIG_UBSAN_TRAP=y 时直接整机 panic 重启。
++	 * 这里把非法 node 收敛为 NUMA_NO_NODE（由 slab 走本地节点），合法调用方
++	 * 行为不变，该越界也就无法再从任何入口（sysfs / ioctl / 其它）发生。
++	 */
++	if (unlikely(node < NUMA_NO_NODE || node >= nr_node_ids))
++		node = NUMA_NO_NODE;
++
+ 	p = ___slab_alloc(s, gfpflags, node, addr, c);
+ 	return p;
+ }
