@@ -1324,29 +1324,89 @@ jobs:
             exit 1
           }
 
-          NODE_PATCH="$ZZH_PATCHES/prio_patch/slab_node_guard.patch"
-          if [ ! -f "$NODE_PATCH" ]; then
-            node_fail "未找到补丁文件 prio_patch/slab_node_guard.patch"
-          fi
-
           # 幂等：已含改动则跳过
-          if grep -q "ZCACHE_NODE_GUARD" mm/slub.c; then
+          if grep -q "ZCACHE_NODE_GUARD" mm/slub.c 2>/dev/null; then
             echo "mm/slub.c 已含 node 校验改动，跳过"
             exit 0
           fi
 
-          if git apply --check -p1 "$NODE_PATCH" >/dev/null 2>&1; then
-            git apply -p1 "$NODE_PATCH"
-          elif patch -p1 --forward --batch < "$NODE_PATCH" >/dev/null 2>&1; then
-            echo "已通过 patch 应用"
-          else
-            node_fail "mm/slub.c 补丁未应用（内核版本不匹配）"
+          if [ ! -f mm/slub.c ]; then
+            node_fail "未找到 mm/slub.c（内核源码树结构异常）"
+          fi
+
+          # 方法1（主）：awk 精确插入
+          # 锚点：stat(s, ALLOC_SLOWPATH); —— 在所有内核版本（5.10~6.12）中
+          # 均存在且唯一，不依赖行号、函数签名或标签名（reread_slab / reread_page）
+          awk '
+          /stat\(s, ALLOC_SLOWPATH\)/ && !done {
+            print
+            print "\t/* ZCACHE_NODE_GUARD: clamp invalid node from vendor zcache prio_store */"
+            print "\tif (unlikely(node < NUMA_NO_NODE || node >= nr_node_ids))"
+            print "\t\tnode = NUMA_NO_NODE;"
+            done = 1
+            next
+          }
+          { print }
+          ' mm/slub.c > mm/slub.c.tmp && mv mm/slub.c.tmp mm/slub.c
+
+          # 方法2（备）：patch 文件（awk 未命中时，fuzz=3 容忍标签名差异）
+          if ! grep -q "ZCACHE_NODE_GUARD" mm/slub.c; then
+            NODE_PATCH="$ZZH_PATCHES/prio_patch/slab_node_guard.patch"
+            if [ -f "$NODE_PATCH" ]; then
+              git apply -p1 "$NODE_PATCH" 2>/dev/null || \
+              patch -p1 --forward --batch --fuzz=3 < "$NODE_PATCH" 2>/dev/null || true
+            fi
           fi
 
           if ! grep -q "ZCACHE_NODE_GUARD" mm/slub.c; then
-            node_fail "补丁应用后校验失败"
+            node_fail "mm/slub.c 补丁未应用（找不到 ALLOC_SLOWPATH 锚点）"
           fi
-          echo "已在 slab 慢路径入口校验 node（非法值收敛为 NUMA_NO_NODE）"
+          echo "已在 ___slab_alloc 入口校验 node（非法值收敛为 NUMA_NO_NODE）"
+      - name: 容忍 module_layout 版本不匹配（修复厂商模块加载失败）
+        working-directory: ${{ env.KERNEL_ROOT }}/common
+        run: |
+          # 自编内核的 struct module 布局与厂商树外模块（bootprof.ko 等）不一致，
+          # 导致 module_layout 符号 CRC 不匹配，模块加载报：
+          #   "disagrees about version of symbol module_layout" → Exec format error
+          # module_layout() 是空函数，CRC 仅是布局指示器，非真实接口契约；
+          # 这里让 check_modstruct_version() 对 module_layout 始终放行，
+          # 其他符号的版本检查不受影响。
+          modver_fail() {
+            if [ "$SKIP_INCOMPATIBLE" = "true" ]; then
+              echo "::warning title=module_layout 补丁已跳过::$1"
+              if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+                echo "" >> "$GITHUB_STEP_SUMMARY"
+                echo "> ⏭️ **module_layout 容忍** 已自动跳过：$1（构建未中断）" >> "$GITHUB_STEP_SUMMARY"
+              fi
+              exit 0
+            fi
+            echo "::error::$1"
+            exit 1
+          }
+
+          MODVER_PATCH="$ZZH_PATCHES/modver_patch/tolerate_module_layout_mismatch.patch"
+          if [ ! -f "$MODVER_PATCH" ]; then
+            modver_fail "未找到补丁文件 modver_patch/tolerate_module_layout_mismatch.patch"
+          fi
+
+          # 幂等：已含改动则跳过
+          if grep -q "Tolerate module_layout CRC mismatch" kernel/module/version.c; then
+            echo "kernel/module/version.c 已含 module_layout 容忍改动，跳过"
+            exit 0
+          fi
+
+          if git apply --check -p1 "$MODVER_PATCH" >/dev/null 2>&1; then
+            git apply -p1 "$MODVER_PATCH"
+          elif patch -p1 --forward --batch < "$MODVER_PATCH" >/dev/null 2>&1; then
+            echo "已通过 patch 应用"
+          else
+            modver_fail "kernel/module/version.c 补丁未应用（内核版本不匹配）"
+          fi
+
+          if ! grep -q "Tolerate module_layout CRC mismatch" kernel/module/version.c; then
+            modver_fail "补丁应用后校验失败"
+          fi
+          echo "module_layout 版本检查已容忍（厂商模块可正常加载）"
       - name: 添加 BBG 基带保护补丁
         if: inputs.use_bbg
         working-directory: ${{ env.KERNEL_ROOT }}
@@ -1659,20 +1719,20 @@ jobs:
 
           sed -i 's/check_defconfig//' ./common/build.config.gki
 
-      - name: 添加 SUSFS 配置
+      - name: 添加 SUSFS 配置（验证：保留框架，禁用全部子功能，定位春秋崩溃根因）
         if: inputs.enable_susfs
         run: |
           cat >> "$DEFCONFIG" << 'EOF'
           CONFIG_KSU_SUSFS=y
-          CONFIG_KSU_SUSFS_SUS_PATH=y
-          CONFIG_KSU_SUSFS_SUS_MOUNT=y
-          CONFIG_KSU_SUSFS_SUS_KSTAT=y
-          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
-          CONFIG_KSU_SUSFS_ENABLE_LOG=y
-          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
-          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
-          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
-          CONFIG_KSU_SUSFS_SUS_MAP=y
+          # CONFIG_KSU_SUSFS_SUS_PATH is not set
+          # CONFIG_KSU_SUSFS_SUS_MOUNT is not set
+          # CONFIG_KSU_SUSFS_SUS_KSTAT is not set
+          # CONFIG_KSU_SUSFS_SPOOF_UNAME is not set
+          # CONFIG_KSU_SUSFS_ENABLE_LOG is not set
+          # CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS is not set
+          # CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG is not set
+          # CONFIG_KSU_SUSFS_OPEN_REDIRECT is not set
+          # CONFIG_KSU_SUSFS_SUS_MAP is not set
           EOF
 
       - name: 配置内核名称
