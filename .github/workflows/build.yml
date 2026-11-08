@@ -1317,16 +1317,83 @@ jobs:
             swap_fail "mm/swapfile.c 补丁未应用（找不到 SWAP_FLAGS_VALID 锚点）"
           fi
           echo "swapon 已改为直接返回 -EINVAL，swap 不会再被启用"
-      - name: 校验 slab 分配 node（规避厂商模块越界重启）
+      - name: 忽略 zcache prio 写入（源头拦截，规避厂商模块越界重启）
         working-directory: ${{ env.KERNEL_ROOT }}/common
         run: |
-          # 厂商树外 zcache 模块的 prio_store 会把越界 node 值传给
-          # alloc_io_context -> kmem_cache_alloc_node -> __slab_alloc，
-          # 越界索引 s->node[node] 触发 UBSAN array index out of bounds；
-          # CONFIG_UBSAN_TRAP=y 时直接整机 panic 重启。
-          # zcache 模块标记为 permanent 无法卸载，且为闭源无法修复；
-          # 这里在 slab 慢路径入口把非法 node 收敛为 NUMA_NO_NODE，
-          # 覆盖 sysfs / ioctl 等所有入口，合法调用方行为不变。
+          # /sys/zcache/prio 的写入会进厂商 zcache 模块的 prio_store；启动早期其线程/池表
+          # 尚未初始化完成时会数组越界，配合 CONFIG_UBSAN_TRAP=y 直接导致整机重启。
+          # 这里在 sysfs 写入入口忽略该节点的写入（吞掉、不拒绝），避免触发该路径。
+          # 这是第一层防护（源头拦截），slab_node_guard 是第二层（后备）。
+          prio_fail() {
+            if [ "$SKIP_INCOMPATIBLE" = "true" ]; then
+              echo "::warning title=忽略 zcache prio 写入已跳过::$1"
+              if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+                echo "" >> "$GITHUB_STEP_SUMMARY"
+                echo "> ⏭️ **忽略 zcache prio 写入** 已自动跳过：$1（构建未中断）" >> "$GITHUB_STEP_SUMMARY"
+              fi
+              exit 0
+            fi
+            echo "::error::$1"
+            exit 1
+          }
+
+          PRIO_PATCH="$ZZH_PATCHES/prio_patch/ignore_zcache_prio.patch"
+          if [ ! -f "$PRIO_PATCH" ]; then
+            prio_fail "未找到补丁文件 prio_patch/ignore_zcache_prio.patch"
+          fi
+
+          # 幂等：已含改动则跳过
+          if grep -q "ZCACHE_PRIO_WRITE_IGNORE" fs/sysfs/file.c 2>/dev/null; then
+            echo "fs/sysfs/file.c 已含忽略写入改动，跳过"
+            exit 0
+          fi
+
+          # 方法1（主）：patch 文件（--fuzz=3 容忍上下文偏差）
+          if git apply --check -p1 "$PRIO_PATCH" >/dev/null 2>&1; then
+            git apply -p1 "$PRIO_PATCH"
+          elif patch -p1 --forward --batch --fuzz=3 < "$PRIO_PATCH" >/dev/null 2>&1; then
+            echo "已通过 patch 应用（fuzz=3）"
+          else
+            # 方法2（备）：awk 精确插入
+            # 锚点：sysfs 写入路径中 "if (!count) return 0;" → "return ops->store("
+            SYSFS_FILE="fs/sysfs/file.c"
+            if [ -f "$SYSFS_FILE" ]; then
+              awk '
+              /if \(!count\)/ { saw_count = 1 }
+              saw_count && /return 0;/ {
+                  print
+                  print ""
+                  print "\t/*"
+                  print "\t * ZCACHE_PRIO_WRITE_IGNORE: 厂商 zcache 模块在启动早期处理"
+                  print "\t * /sys/zcache/prio 的写入时，会在其线程/池表尚未初始化完成的情况下越界"
+                  print "\t * （prio_store -> alloc_io_context -> ___slab_alloc），配合 CONFIG_UBSAN_TRAP=y"
+                  print "\t * 会直接导致整机 panic 重启。这里在 sysfs 写入入口精确匹配该节点并忽略本次写入"
+                  print "\t * （按已写入长度返回，不调用底层 store）；读路径与其它 sysfs 属性不受影响。"
+                  print "\t */"
+                  print "\tif (of->kn && of->kn->parent &&"
+                  print "\t    !strcmp(of->kn->name, \"prio\") &&"
+                  print "\t    !strcmp(of->kn->parent->name, \"zcache\"))"
+                  print "\t\treturn count;"
+                  print ""
+                  saw_count = 0
+                  done = 1
+                  next
+              }
+              { print }
+              END { if (!done) exit 1 }
+              ' "$SYSFS_FILE" > "$SYSFS_FILE.tmp" && mv "$SYSFS_FILE.tmp" "$SYSFS_FILE"
+            fi
+          fi
+
+          if ! grep -q "ZCACHE_PRIO_WRITE_IGNORE" fs/sysfs/file.c 2>/dev/null; then
+            prio_fail "fs/sysfs/file.c 补丁未应用（找不到 sysfs 写入锚点）"
+          fi
+          echo "已在 sysfs 写入入口忽略 /sys/zcache/prio 的写入（源头拦截）"
+      - name: 校验 slab 分配 node（后备防护，规避厂商模块越界重启）
+        working-directory: ${{ env.KERNEL_ROOT }}/common
+        run: |
+          # 第二层防护：即使 sysfs 源头拦截被绕过（ioctl 等其他路径），
+          # 在 slab 慢路径入口把非法 node 收敛为 NUMA_NO_NODE。
           # CONFIG_UBSAN_TRAP 保持开启：若厂商模块还有别的越界，继续当场上报。
           node_fail() {
             if [ "$SKIP_INCOMPATIBLE" = "true" ]; then
