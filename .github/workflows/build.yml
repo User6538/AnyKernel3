@@ -1342,7 +1342,17 @@ jobs:
           elif patch -p1 --forward --batch < "$NODE_PATCH" >/dev/null 2>&1; then
             echo "已通过 patch 应用"
           else
-            node_fail "mm/slub.c 补丁未应用（内核版本不匹配）"
+            # 固定补丁未匹配当前内核版本（函数签名/行号差异），
+            # 回退到版本无关注入器：用 ___slab_alloc（三下划线慢路径核心函数，
+            # 5.10-6.12 所有版本共用此名）作为锚点，在函数体开头注入 node 校验。
+            echo "固定补丁未匹配当前内核版本，回退到版本无关注入（___slab_alloc 锚点）..."
+            INJECT="$ZZH_PATCHES/prio_patch/inject_node_guard.py"
+            if [ ! -f "$INJECT" ]; then
+              node_fail "未找到版本无关注入器 prio_patch/inject_node_guard.py"
+            fi
+            if ! python3 "$INJECT"; then
+              node_fail "版本无关注入也失败：未找到 ___slab_alloc 或注入异常"
+            fi
           fi
 
           if ! grep -q "ZCACHE_NODE_GUARD" mm/slub.c; then
