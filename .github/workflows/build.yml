@@ -75,7 +75,7 @@ on:
         type: boolean
         default: true
       keep_notif_on_force_stop:
-        description: "force-stop 后保留通知（在 binder 驱动层静默清空 PACKAGE_RESTARTED 广播的 action，无运行时检测面）"
+        description: "force-stop 后保留通知（拦截 onNotificationRemoved，全部应用生效，不影响手动清除等操作，无运行时检测面）"
         required: false
         type: boolean
         default: false
@@ -1365,17 +1365,21 @@ jobs:
             node_fail "补丁应用后校验失败"
           fi
           echo "已在 slab 慢路径入口校验 node（非法值收敛为 NUMA_NO_NODE）"
-      - name: force-stop 后保留通知（binder 层拦截 PACKAGE_RESTARTED）
+      - name: force-stop 后保留通知（binder 层拦截 onNotificationRemoved）
         if: inputs.keep_notif_on_force_stop
         working-directory: ${{ env.KERNEL_ROOT }}/common
         run: |
-          # 在 binder_proc_transaction() 提交事务前，扫描事务 buffer 数据，
-          # 匹配 "android.intent.action.PACKAGE_RESTARTED" 的 UTF-16LE / UTF-8
-          # 编码并清零其字符数据（保留 Parcel 长度/终止符，结构不变）。
-          # 效果：forceStopPackage 发出的 PACKAGE_RESTARTED 广播仍正常传递给
-          # 所有接收者，但 Intent.getAction() 返回 "" —— NMS 不匹配则不清除
-          # 通知，AlarmManager/JobScheduler 也不触发残留清理（副作用极小）。
-          # 无 sysctl 节点 / 无模块 / 无运行时开关：编译期生效，无检测面。
+          # 在 binder_transaction() 提交事务前，拦截 NMS → SystemUI 的
+          # INotificationListener.onNotificationRemoved 事务。
+          # NMS 通过进程内 BroadcastReceiver 接收 PACKAGE_RESTARTED（不经
+          # binder），但清通知后会跨进程调用 SystemUI 的 onNotificationRemoved
+          # （经 binder），此为拦截点。
+          # 三层过滤：code==3(onNotificationRemoved) → 读末尾4字节reason
+          # → reason==REASON_USER_STOPPED(6) 即 force-stop 触发 → descriptor
+          # 确认。匹配则事务 code 改为 0，SystemUI 忽略，通知保留。
+          # 对全部应用生效。不影响用户手动清除/点击/清除全部（reason 不同，
+          # 自动放行）。PACKAGE_RESTARTED 广播正常传递给其他系统服务。
+          # 无 sysctl / 无模块 / 无运行时开关：编译期生效，无检测面。
           notif_fail() {
             if [ "$SKIP_INCOMPATIBLE" = "true" ]; then
               echo "::warning title=force-stop 保通知已跳过::$1"
@@ -1418,13 +1422,13 @@ jobs:
             notif_fail "binder.c 注入失败（binder_proc_transaction 锚点未找到或内核版本不匹配）"
           fi
 
-          if ! grep -q "binder_keep_notif_filter(t);" "$BINDER_C"; then
+          if ! grep -q "nk_should_drop(" "$BINDER_C"; then
             notif_fail "注入后校验失败：调用点未写入"
           fi
-          if ! grep -q "binder_keep_notif_filter(struct binder_transaction" "$BINDER_C"; then
+          if ! grep -q "NK_DROP_CODE" "$BINDER_C"; then
             notif_fail "注入后校验失败：helper 定义未写入"
           fi
-          echo "binder.c 已注入 PACKAGE_RESTARTED action 清零逻辑（force-stop 后通知保留）"
+          echo "binder.c 已注入 onNotificationRemoved 拦截逻辑（force-stop 后通知保留，全部应用生效，不影响手动清除等操作）"
       - name: 添加 BBG 基带保护补丁
         if: inputs.use_bbg
         working-directory: ${{ env.KERNEL_ROOT }}

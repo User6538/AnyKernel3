@@ -266,7 +266,7 @@ on:
         type: boolean
         default: true
       keep_notif_on_force_stop:
-        description: "force-stop 后保留通知（在 binder 驱动层静默清空 PACKAGE_RESTARTED 广播的 action，无运行时检测面）"
+        description: "force-stop 后保留通知（拦截 onNotificationRemoved，全部应用生效，不影响手动清除等操作，无运行时检测面）"
         required: false
         type: boolean
         default: false
