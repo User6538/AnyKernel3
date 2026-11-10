@@ -74,6 +74,11 @@ on:
         required: false
         type: boolean
         default: true
+      keep_notif_on_force_stop:
+        description: "force-stop 后保留通知（在 binder 驱动层静默清空 PACKAGE_RESTARTED 广播的 action，无运行时检测面）"
+        required: false
+        type: boolean
+        default: false
       use_bbg:
         required: true
         type: boolean
@@ -149,6 +154,7 @@ jobs:
           echo "SUSFS 状态    : ${{ inputs.enable_susfs }}"
           echo "ZRAM 压缩     : ${{ inputs.use_zram }}"
           echo "关闭 swap     : ${{ inputs.cancel_swap }}"
+          echo "force-stop 保通知: ${{ inputs.keep_notif_on_force_stop }}"
           echo "BBG 补丁      : ${{ inputs.use_bbg }}"
           echo "网络增强      : ${{ inputs.use_net_enhance }}"
           echo "KPM 功能      : ${{ inputs.use_kpm }}"
@@ -1359,6 +1365,66 @@ jobs:
             node_fail "补丁应用后校验失败"
           fi
           echo "已在 slab 慢路径入口校验 node（非法值收敛为 NUMA_NO_NODE）"
+      - name: force-stop 后保留通知（binder 层拦截 PACKAGE_RESTARTED）
+        if: inputs.keep_notif_on_force_stop
+        working-directory: ${{ env.KERNEL_ROOT }}/common
+        run: |
+          # 在 binder_proc_transaction() 提交事务前，扫描事务 buffer 数据，
+          # 匹配 "android.intent.action.PACKAGE_RESTARTED" 的 UTF-16LE / UTF-8
+          # 编码并清零其字符数据（保留 Parcel 长度/终止符，结构不变）。
+          # 效果：forceStopPackage 发出的 PACKAGE_RESTARTED 广播仍正常传递给
+          # 所有接收者，但 Intent.getAction() 返回 "" —— NMS 不匹配则不清除
+          # 通知，AlarmManager/JobScheduler 也不触发残留清理（副作用极小）。
+          # 无 sysctl 节点 / 无模块 / 无运行时开关：编译期生效，无检测面。
+          notif_fail() {
+            if [ "$SKIP_INCOMPATIBLE" = "true" ]; then
+              echo "::warning title=force-stop 保通知已跳过::$1"
+              if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+                echo "" >> "$GITHUB_STEP_SUMMARY"
+                echo "> ⏭️ **force-stop 保通知** 已自动跳过：$1（构建未中断）" >> "$GITHUB_STEP_SUMMARY"
+              fi
+              exit 0
+            fi
+            echo "::error::$1"
+            exit 1
+          }
+
+          # 定位 binder.c（5.10 在 drivers/staging/android，6.x 在 drivers/android）
+          BINDER_C=""
+          for cand in drivers/android/binder.c drivers/staging/android/binder.c; do
+            if [ -f "$cand" ]; then BINDER_C="$cand"; break; fi
+          done
+          if [ -z "$BINDER_C" ]; then
+            BINDER_C=$(find drivers -name binder.c -path '*android*' 2>/dev/null | head -1)
+          fi
+          if [ -z "$BINDER_C" ] || [ ! -f "$BINDER_C" ]; then
+            notif_fail "未找到 drivers/android/binder.c（binder 驱动路径异常）"
+          fi
+          echo "目标文件: $BINDER_C"
+
+          HELPER="$ZZH_PATCHES/notif_keep_patch/binder_keep_notif.c"
+          INJECTOR="$ZZH_PATCHES/notif_keep_patch/inject_binder_notif.py"
+          if [ ! -f "$HELPER" ] || [ ! -f "$INJECTOR" ]; then
+            notif_fail "未找到 notif_keep_patch 补丁文件（binder_keep_notif.c / inject_binder_notif.py）"
+          fi
+
+          # 幂等：已含标记则跳过
+          if grep -q "keep notification on force-stop" "$BINDER_C"; then
+            echo "$BINDER_C 已含 force-stop 保通知改动，跳过"
+            exit 0
+          fi
+
+          if ! python3 "$INJECTOR" "$BINDER_C" "$HELPER"; then
+            notif_fail "binder.c 注入失败（binder_proc_transaction 锚点未找到或内核版本不匹配）"
+          fi
+
+          if ! grep -q "binder_keep_notif_filter(t);" "$BINDER_C"; then
+            notif_fail "注入后校验失败：调用点未写入"
+          fi
+          if ! grep -q "binder_keep_notif_filter(struct binder_transaction" "$BINDER_C"; then
+            notif_fail "注入后校验失败：helper 定义未写入"
+          fi
+          echo "binder.c 已注入 PACKAGE_RESTARTED action 清零逻辑（force-stop 后通知保留）"
       - name: 添加 BBG 基带保护补丁
         if: inputs.use_bbg
         working-directory: ${{ env.KERNEL_ROOT }}
