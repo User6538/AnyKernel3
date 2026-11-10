@@ -265,11 +265,6 @@ on:
         required: false
         type: boolean
         default: true
-      keep_notif_on_force_stop:
-        description: "force-stop 后保留通知（拦截 onNotificationRemoved，全部应用生效，不影响手动清除等操作，无运行时检测面）"
-        required: false
-        type: boolean
-        default: false
       use_bbg:
         description: "启用 BBG 基带保护"
         required: true
@@ -433,7 +428,6 @@ jobs:
       build_time: ${{ inputs.build_time || '' }}
       use_zram: ${{ inputs.use_zram }}
       cancel_swap: ${{ inputs.cancel_swap }}
-      keep_notif_on_force_stop: ${{ inputs.keep_notif_on_force_stop }}
       use_bbg: ${{ inputs.use_bbg }}
       use_net_enhance: ${{ inputs.use_net_enhance }}
       use_kpm: ${{ inputs.use_kpm }}
