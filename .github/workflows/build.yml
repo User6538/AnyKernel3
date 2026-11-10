@@ -1374,7 +1374,11 @@ jobs:
           # NMS 通过进程内 BroadcastReceiver 接收 PACKAGE_RESTARTED（不经
           # binder），但清通知后会跨进程调用 SystemUI 的 onNotificationRemoved
           # （经 binder），此为拦截点。
-          # 三层过滤：code==3(onNotificationRemoved) → 读末尾4字节reason
+          # 调用点锚点: "binder_proc_transaction(t," 匹配 binder_transaction()
+          # 中所有调用 (同步路径 + 异步路径, 通常 2 处)。
+          # onNotificationRemoved 是 oneway, 走异步路径, 但两条路径都注入
+          # 确保 coverage。nk_should_drop 内部三层过滤放行非目标事务。
+          # 三层过滤: code==3(onNotificationRemoved) → 读末尾4字节reason
           # → reason==REASON_USER_STOPPED(6) 即 force-stop 触发 → descriptor
           # 确认。匹配则事务 code 改为 0，SystemUI 忽略，通知保留。
           # 对全部应用生效。不影响用户手动清除/点击/清除全部（reason 不同，
@@ -1422,13 +1426,17 @@ jobs:
             notif_fail "binder.c 注入失败（binder_proc_transaction 锚点未找到或内核版本不匹配）"
           fi
 
-          if ! grep -q "nk_should_drop(" "$BINDER_C"; then
-            notif_fail "注入后校验失败：调用点未写入"
+          # 校验调用点: nk_should_drop(tr->data.ptr.buffer 只出现在注入的
+          # 调用中, 不出现在 helper 定义 (定义用 binder_uintptr_t user_buf)。
+          # 这能区分 "函数已定义" 和 "函数已被调用", 防止 -Wunused-function。
+          if ! grep -q "nk_should_drop(tr->data.ptr.buffer" "$BINDER_C"; then
+            notif_fail "注入后校验失败：调用点未写入（nk_should_drop 已定义但未被调用，会导致 -Wunused-function）"
           fi
           if ! grep -q "NK_DROP_CODE" "$BINDER_C"; then
             notif_fail "注入后校验失败：helper 定义未写入"
           fi
-          echo "binder.c 已注入 onNotificationRemoved 拦截逻辑（force-stop 后通知保留，全部应用生效，不影响手动清除等操作）"
+          CALL_COUNT=$(grep -c "nk_should_drop(tr->data.ptr.buffer" "$BINDER_C" || true)
+          echo "binder.c 已注入 onNotificationRemoved 拦截逻辑（${CALL_COUNT} 个调用点，force-stop 后通知保留，全部应用生效，不影响手动清除等操作）"
       - name: 添加 BBG 基带保护补丁
         if: inputs.use_bbg
         working-directory: ${{ env.KERNEL_ROOT }}
