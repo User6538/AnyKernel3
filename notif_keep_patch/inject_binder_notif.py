@@ -3,27 +3,31 @@
 """
 inject_binder_notif.py — inject the notification-keep helper into binder.c
 
-This script performs a line-number-independent injection so the patch survives
-across Android 13..16 / kernel 5.10..6.12 binder.c layout changes.
+行号无关注入器, 跨 Android 13..16 / kernel 5.10..6.12 稳健。
 
-Two injection points, both anchored on stable, unique code patterns:
+两个注入点, 均锚定在所有版本都存在且唯一的代码模式:
 
   1. HELPER DEFINITION
-     Inserted immediately *before* the binder_proc_transaction() doc comment:
-         * binder_proc_transaction() - sends a transaction to a process
-     This doc comment exists in every binder.c version that has the function.
+     插入在 binder_proc_transaction() 文档注释前 (或函数签名前)。
+     文档注释: "* binder_proc_transaction() - sends a transaction to a process"
+     无注释时回退到函数签名: "binder_proc_transaction(struct binder_transaction *t,"
 
   2. CALL SITE
-     Inserted immediately *after* the first executable statement inside
-     binder_proc_transaction():
-         BUG_ON(!node);
-     followed by binder_node_lock(node);  — present in every version.
+     插入在 binder_transaction() 中调用 binder_proc_transaction() 的位置前。
+     调用点特征: "if (!binder_proc_transaction(t,"
+     (定义处是 "static int binder_proc_transaction(struct binder_transaction *t,"
+      不含 "!binder_proc_transaction(t,", 不会误匹配)
+
+     注入内容:
+         if (nk_should_drop(tr->data.ptr.buffer, tr->data_size, t->code))
+             t->code = NK_DROP_CODE;
+     此时 tr (binder_transaction_data *) 在作用域内, t->code 已赋值,
+     数据已拷贝到目标 buffer, 可用 copy_from_user 从调用方用户空间读取。
 
 Usage:
     python3 inject_binder_notif.py <binder.c path> <helper.c path>
 
-Exits 0 on success (and prints the verification marker), non-zero on failure.
-Idempotent: re-running on an already-patched file is a no-op.
+幂等: 对已注入的文件重复运行是 no-op。
 """
 import sys
 import os
@@ -53,27 +57,24 @@ def main():
     src = read(binder_path)
     helper = read(helper_path)
 
-    # Idempotency: already patched.
+    # 幂等: 已注入则跳过
     if MARKER in src:
         print(f"already patched ({MARKER}), skipping")
         return 0
 
-    # --- Anchor 1: helper definition ---
-    # Preferred: insert right before the binder_proc_transaction() doc comment.
-    # Fallback: if the doc comment was stripped by a downstream, insert right
-    # before the function signature line.
+    # --- 锚点 1: helper 定义 ---
+    # 优先: binder_proc_transaction() 文档注释前
+    # 回退: 函数签名行前
     doc_needle = "* binder_proc_transaction() - sends a transaction"
     sig_needle = "binder_proc_transaction(struct binder_transaction *t,"
     doc_idx = src.find(doc_needle)
     if doc_idx >= 0:
-        # walk back to the '/**' that opens the comment, then to its line start
         block_open = src.rfind("/**", 0, doc_idx)
         if block_open < 0:
             block_open = src.rfind("\n", 0, doc_idx) + 1
         else:
             block_open = src.rfind("\n", 0, block_open) + 1
     else:
-        # no doc comment — fall back to the function signature line
         sig_idx = src.find(sig_needle)
         if sig_idx < 0:
             print("anchor 1 not found: neither binder_proc_transaction doc "
@@ -86,37 +87,56 @@ def main():
     helper_block = helper.rstrip("\n") + "\n\n"
     src = src[:block_open] + helper_block + src[block_open:]
 
-    # --- Anchor 2: call site ---
-    # Inside binder_proc_transaction, after the first BUG_ON(!node);
-    call_needle = "BUG_ON(!node);"
+    # --- 锚点 2: 调用点 ---
+    # binder_transaction() 中: if (!binder_proc_transaction(t, ...))
+    # 定义处不含 "!binder_proc_transaction(t,", 不会误匹配
+    call_needle = "!binder_proc_transaction(t,"
     call_idx = src.find(call_needle, block_open + len(helper_block))
     if call_idx < 0:
-        print("anchor 2 not found: BUG_ON(!node) inside "
-              "binder_proc_transaction", file=sys.stderr)
+        print("anchor 2 not found: !binder_proc_transaction(t, call site "
+              "in binder_transaction()", file=sys.stderr)
         print("helper was inserted but call site was not — manual fix needed",
               file=sys.stderr)
-        # still write the helper in; the build will fail clearly with a
-        # missing-symbol error rather than a silent mis-inject.
-        pass
+        # 仍写入 helper, 编译时会因未定义符号报错 (清晰可定位)
     else:
-        end_of_line = src.find("\n", call_idx)
-        if end_of_line < 0:
-            end_of_line = len(src)
-        inject = ("\n\t/* User6538/AnyKernel3 — keep notification "
-                  "on force-stop */\n\tbinder_keep_notif_filter(t);\n")
-        src = src[:end_of_line] + inject + src[end_of_line:]
+        # 找到调用所在行的行首
+        line_start = src.rfind("\n", 0, call_idx) + 1
+        # 提取缩进 (行首到 'if' 前的空白)
+        if_prefix = src[line_start:call_idx]
+        # 去掉 'if (' 或 'if(' 部分, 只保留缩进
+        indent = ""
+        for ch in if_prefix:
+            if ch in " \t":
+                indent += ch
+            else:
+                break
+        # 如果缩进为空, 默认用 tab (binder_transaction 函数体一级缩进)
+        if not indent:
+            indent = "\t"
+        inject = (
+            f"\n{indent}/* User6538/AnyKernel3 — keep notification "
+            f"on force-stop */\n"
+            f"{indent}if (nk_should_drop(tr->data.ptr.buffer, "
+            f"tr->data_size, t->code))\n"
+            f"{indent}\tt->code = NK_DROP_CODE;\n"
+        )
+        src = src[:line_start] + inject + src[line_start:]
 
-    # --- write back ---
+    # --- 写回 ---
     with open(binder_path, "w", encoding="utf-8") as f:
         f.write(src)
 
-    # --- verify ---
+    # --- 校验 ---
     if MARKER not in src:
         print("verification failed: marker not present after injection",
               file=sys.stderr)
         return 1
-    if "binder_keep_notif_filter(t);" not in src:
-        print("verification failed: call site not present after injection",
+    if "nk_should_drop(" not in src:
+        print("verification failed: nk_should_drop call not present",
+              file=sys.stderr)
+        return 1
+    if "NK_DROP_CODE" not in src:
+        print("verification failed: NK_DROP_CODE not present",
               file=sys.stderr)
         return 1
     print(f"patched {binder_path}: helper injected + call site wired "
