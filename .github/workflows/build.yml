@@ -94,6 +94,11 @@ on:
         required: false
         type: boolean
         default: false
+      disable_verity:
+        description: "关闭 dm-verity 校验（短路 verity_verify_io + verity_handle_err，dm 设备仍创建但校验恒过）"
+        required: false
+        type: boolean
+        default: false
       enable_susfs:
         required: true
         type: boolean
@@ -154,6 +159,7 @@ jobs:
           echo "KPM 功能      : ${{ inputs.use_kpm }}"
           echo "Re-Kernel     : ${{ inputs.use_rekernel }}"
           echo "CVE-2026-43499: ${{ inputs.cve_2026_43499_patch }}"
+          echo "关闭 dm-verity: ${{ inputs.disable_verity }}"
           echo "Droidspaces   : ${{ inputs.droidspaces }}"
           echo "NTSync        : ${{ inputs.droidspaces_ntsync }}"
           echo "兼容跳过      : ${{ inputs.skip_incompatible }}"
@@ -1359,6 +1365,68 @@ jobs:
             node_fail "补丁应用后校验失败"
           fi
           echo "已在 slab 慢路径入口校验 node（非法值收敛为 NUMA_NO_NODE）"
+      - name: 关闭 dm-verity 校验（短路 verity_verify_io + verity_handle_err）
+        if: inputs.disable_verity
+        working-directory: ${{ env.KERNEL_ROOT }}/common
+        run: |
+          # dm-verity 校验链路:
+          #   fstab verify flag → init SetUpDmVerity → AvbHandle::SetUpAvbHashtree
+          #   → kernel dm-verity → verity_verify_io → verity_handle_err
+          #
+          # 本补丁在内核源码层面短路两个核心函数:
+          #   1. verity_verify_io → return 0 (跳过全部哈希计算, 校验恒过)
+          #   2. verity_handle_err → return 0 (兜底, 错误处理返回非致命)
+          #
+          # dm-verity 模块正常加载, first-stage init 正常创建 dm 设备,
+          # 但校验永远返回成功 — 修改过的分区照常挂载。
+          # 不影响 fs-verity (文件级校验, 独立链路)。
+          verity_fail() {
+            if [ "$SKIP_INCOMPATIBLE" = "true" ]; then
+              echo "::warning title=关闭 dm-verity 已跳过::$1"
+              if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+                echo "" >> "$GITHUB_STEP_SUMMARY"
+                echo "> ⏭️ **关闭 dm-verity** 已自动跳过：$1（构建未中断）" >> "$GITHUB_STEP_SUMMARY"
+              fi
+              exit 0
+            fi
+            echo "::error::$1"
+            exit 1
+          }
+
+          # 定位 dm-verity.c (6.x 在 drivers/md/dm-verity.c)
+          VERITY_C=""
+          for cand in drivers/md/dm-verity.c drivers/md/dm-verity-target.c; do
+            if [ -f "$cand" ]; then VERITY_C="$cand"; break; fi
+          done
+          if [ -z "$VERITY_C" ]; then
+            VERITY_C=$(find drivers/md -name 'dm-verity*.c' 2>/dev/null | head -1)
+          fi
+          if [ -z "$VERITY_C" ] || [ ! -f "$VERITY_C" ]; then
+            verity_fail "未找到 drivers/md/dm-verity.c（dm-verity 源码路径异常）"
+          fi
+          echo "目标文件: $VERITY_C"
+
+          INJECTOR="$ZZH_PATCHES/verity_patch/disable_verity.py"
+          if [ ! -f "$INJECTOR" ]; then
+            verity_fail "未找到 verity_patch/disable_verity.py"
+          fi
+
+          # 幂等：已含标记则跳过
+          if grep -q "dm-verity enforcement disabled" "$VERITY_C"; then
+            echo "$VERITY_C 已含 dm-verity 关闭改动，跳过"
+            exit 0
+          fi
+
+          if ! python3 "$INJECTOR" "$VERITY_C"; then
+            verity_fail "dm-verity.c 注入失败（verity_verify_io / verity_handle_err 未找到，源码可能已重构）"
+          fi
+
+          # 校验
+          if ! grep -q "dm-verity enforcement disabled" "$VERITY_C"; then
+            verity_fail "注入后校验失败：标记未写入"
+          fi
+          PATCHED=$(grep -c "dm-verity enforcement disabled" "$VERITY_C" || true)
+          echo "dm-verity 校验已短路（${PATCHED} 个函数 return 0，dm 设备仍创建但校验恒过）"
       - name: 添加 BBG 基带保护补丁
         if: inputs.use_bbg
         working-directory: ${{ env.KERNEL_ROOT }}

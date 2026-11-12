@@ -285,6 +285,11 @@ on:
         required: false
         type: boolean
         default: false
+      disable_verity:
+        description: "关闭 dm-verity 校验（短路 verity_verify_io + verity_handle_err，dm 设备仍创建但校验恒过）"
+        required: false
+        type: boolean
+        default: false
       cancel_susfs:
         description: "禁用 SUSFS"
         required: true
@@ -433,6 +438,7 @@ jobs:
       use_kpm: ${{ inputs.use_kpm }}
       use_rekernel: ${{ inputs.use_rekernel || false }}
       cve_2026_43499_patch: ${{ inputs.cve_2026_43499_patch }}
+      disable_verity: ${{ inputs.disable_verity }}
       supp_op: ${{ inputs.supp_op || false }}
       enable_susfs: ${{ !inputs.cancel_susfs }}
       droidspaces: ${{ inputs.droidspaces || 'off' }}
